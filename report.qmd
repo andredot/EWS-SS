@@ -1,6 +1,6 @@
 ---
 title: "Early Warning System for Syndromic Surveillance"
-subtitle: "Comparison of Statistical Detection Methods"
+subtitle: "Predictive Epidemiological Detection & Outbreak Tracking"
 author: "Andrea Pedot"
 format:
   html:
@@ -166,13 +166,20 @@ To evaluate the added value of the GAM, we compare its performance against three
 baseline_summary <- df_long |>
   group_by(sindrome) |>
   summarise(
-    gauss_mean_delta = mean(tail(delta_casi, 52), na.rm = TRUE),
-    gauss_sd_delta   = sd(tail(delta_casi, 52), na.rm = TRUE),
-    gauss_upper_95 = gauss_mean_delta + (1.96 * gauss_sd_delta),
-    roll_min_casi    = min(tail(casi, 52*2), na.rm = TRUE),
+    # 1. Historical Range (Rolling 2-year Max)
+    # Serves as a 'Safety Ceiling' based on past extremes
     roll_max_casi    = max(tail(casi, 52*2), na.rm = TRUE),
+    roll_min_casi    = min(tail(casi, 52*2), na.rm = TRUE),
+    
+    # 2. Naive Poisson Expectation
+    # The simplest count baseline: the long-term average
+    poisson_mean     = mean(casi, na.rm = TRUE),
+    
+    # 3. Percentile Benchmarks for Deltas
     p95_delta        = quantile(tail(delta_casi, 52), 0.95, na.rm = TRUE),
-    p99_delta        = quantile(tail(delta_casi, 52), 0.99, na.rm = TRUE)
+    p99_delta        = quantile(tail(delta_casi, 52), 0.99, na.rm = TRUE),
+    
+    .groups = "drop"
   )
 
 kable(baseline_summary, digits = 1, caption = "Historical Benchmarks (Last 52 Weeks)") |>
@@ -195,39 +202,31 @@ It answers to the question: "How many steps away from the average is this?".
 
 ```{r model-fit}
 fit_surveillance_model <- function(df_subset) {
-  # Fit the Negative Binomial GAM
-  # k=20 for long-term trend, k=10 for cyclic seasonality
-  m <- gam(casi ~ s(week_num, k = 20) +
-             s(week_of_year, bs = "cc", k = 10),
-           family = nb(), 
-           data = df_subset, 
-           method = "REML")
+  # Reverting to the stable Option 1 configuration
+  m <- mgcv::gam(casi ~ s(week_num, k = 50) + 
+                       s(week_of_year, bs = "cc", k = 12) + 
+                       dow, 
+                 family = nb(), 
+                 data = df_subset, 
+                 method = "REML")
   
   theta <- m$family$getTheta(TRUE)
   preds <- predict(m, type = "link", se.fit = TRUE)
   
-  # Augment the data with thresholds and residuals
   results <- df_subset |>
     mutate(
       expected = exp(preds$fit),
-      
-      # Statistical Probability
+      # Approach A: Negative Binomial Quantiles
       p_val = pnbinom(casi - 1, mu = expected, size = theta, lower.tail = FALSE),
-      conf_level = (1 - p_val) * 100,
-      
-      # Thresholds (95% and 99% Quantiles)
       limit_95_A = qnbinom(0.95, mu = expected, size = theta),
       limit_99_A = qnbinom(0.99, mu = expected, size = theta),
-      
       status_A = case_when(
         casi > limit_99_A ~ "RED",
         casi > limit_95_A ~ "YELLOW",
         TRUE ~ "GREEN"
       ),
-      
-      # Standardized Residuals (Sigma Score)
+      # Approach B: Sigma Scores
       std_residual = (casi - expected) / sqrt(expected + (expected^2 / theta)),
-      
       status_B = case_when(
         std_residual > 2.57 ~ "RED",    
         std_residual > 1.96 ~ "YELLOW", 
@@ -235,7 +234,6 @@ fit_surveillance_model <- function(df_subset) {
       )
     )
   
-  # Return both the model object and the dataframe
   return(list(model = m, data = results))
 }
 
@@ -260,6 +258,30 @@ Employing both methodologies ensures the detection of various error types and pr
 The combination of a Probability-based method with a Magnitude-based method results in a balanced early warning system. This integration maintains high sensitivity for early outbreak detection while remaining sufficiently stable to filter out routine seasonal noise.
 
 When reviewing weekly alerts, it is essential to distinguish between random statistical fluctuations and emerging public health threats. Alerts with a Sigma Score > 3.0 represent extreme deviations that are virtually impossible by chance alone, but monitoring nine syndromes simultaneously increases the probability of "False Red" alerts to approximately 8.6% per week due to the laws of probability, and a 37% Yellow alert. This means that roughly every three days, the system will flash "Yellow" somewhere, even if absolutely nothing is happening.
+
+### Diagnostic plots
+
+This section evaluates the structural integrity of the GAMs using a basis dimension ($k$) check. We compare the Effective Degrees of Freedom (EDF) against the maximum available knots ($k'$); an EDF significantly lower than the limit suggests the model has successfully identified an optimal smoothing level, while an EDF nearing the limit indicates a "ceiling effect" where the model is attempting to capture high-frequency noise or jagged spikes inherent in daily ED data. While low p-values often persist due to non-smooth human behaviors and reporting artifacts, they do not necessarily invalidate the model’s utility as a robust surveillance baseline, provided the overall trend captures the seasonal and weekly cycles effectively.
+
+
+```{r diagnostic-loop, results='hold'}
+for (s in names(models_list)) {
+  cat("\n========================================================\n")
+  cat("DIAGNOSTICS FOR SYNDROME:", toupper(s), "\n")
+  cat("========================================================\n")
+  
+  mod <- models_list[[s]]
+  if (inherits(mod, "gam")) {
+    check_table <- capture.output(mgcv::k.check(mod))
+    cat(paste(check_table, collapse = "\n"))
+  } else {
+    cat("Warning: Object for", s, "is not a valid GAM object.\n")
+  }
+  cat("\n")
+}
+```
+
+
 
 ## Model Validation
 
@@ -347,22 +369,26 @@ We compare the GAM's performance against the Rolling two-year Baseline using thr
 benchmark_all <- results_df %>%
   left_join(baseline_summary, by = "sindrome") %>%
   group_by(sindrome) %>%
-  arrange(Data_inizio_sett) %>%
-  mutate(
-    # Both models now predict the absolute count ('casi')
-    pred_gam   = expected,
-    pred_gauss = lag(casi) + gauss_mean_delta
-  ) %>%
-  filter(!is.na(pred_gauss)) %>%
   summarise(
-    r2_gam     = 1 - (sum((casi - pred_gam)^2) / sum((casi - mean(casi))^2)),
-    r2_gauss   = 1 - (sum((casi - pred_gauss)^2) / sum((casi - mean(casi))^2)),
-    rmse_gam   = sqrt(mean((casi - pred_gam)^2)),
-    rmse_gauss = sqrt(mean((casi - pred_gauss)^2))
+    # GAM Metrics
+    r2_gam         = 1 - (sum((casi - expected)^2) / sum((casi - mean(casi))^2)),
+    rmse_gam       = sqrt(mean((casi - expected)^2)),
+    
+    # Naive Poisson Metrics (Static Mean)
+    r2_poisson     = 1 - (sum((casi - poisson_mean)^2) / sum((casi - mean(casi))^2)),
+    rmse_poisson   = sqrt(mean((casi - poisson_mean)^2)),
+    
+    # Historical Max Metrics (Ceiling Baseline)
+    # Note: R2 is often negative for Max lines as they aren't 'means', 
+    # but RMSE shows the distance to the 'Safety Ceiling'.
+    rmse_hist_max  = sqrt(mean((casi - roll_max_casi)^2)),
+    
+    .groups = "drop"
   ) %>%
   mutate(across(where(is.numeric), round, 3))
 
-print(benchmark_all)
+kable(benchmark_all, caption = "System Benchmarking: GAM vs. Static & Historical Baselines") |>
+  kable_styling(bootstrap_options = "striped")
 ```
 
 ```{r benchmark-plot}
@@ -370,38 +396,43 @@ plot_data_all <- results_df %>%
   left_join(baseline_summary, by = "sindrome") %>%
   group_by(sindrome) %>%
   arrange(Data_inizio_sett) %>%
-  mutate(
-    # Convert Delta threshold to absolute threshold for comparison
-    baseline_threshold_abs = lag(casi) + gauss_upper_95
-  ) %>%
-  filter(!is.na(baseline_threshold_abs)) %>%
-  # Filter for a meaningful recent window (e.g., last 180 days)
+  # Filter for the last 180 days to keep the visual clean
   filter(Data_inizio_sett >= max(Data_inizio_sett) - 180)
 
-# 2. Generate the faceted comparison plot
 ggplot(plot_data_all, aes(x = Data_inizio_sett)) +
-  # Actual observed counts
-  geom_line(aes(y = casi, color = "Observed"), alpha = 0.5) +
-  # GAM Threshold (Dynamic/Seasonal)
-  geom_line(aes(y = limit_95_A, color = "GAM (NB)"), size = 0.8) +
-  # Gaussian Baseline Threshold (Reactive/Delta)
-  geom_line(aes(y = baseline_threshold_abs, color = "Gaussian Delta"), 
-            linetype = "dotted", size = 0.8) +
+  # Actual observed counts (The background signal)
+  geom_line(aes(y = casi, color = "Observed"), alpha = 0.4) +
+  
+  # GAM Threshold (The Seasonal Ceiling)
+  geom_line(aes(y = limit_95_A, color = "GAM (Seasonal)"), size = 0.9) +
+  
+  # Static Poisson Mean (The Simplest Baseline)
+  geom_hline(aes(yintercept = poisson_mean, color = "Static Mean"), 
+             linetype = "dashed", alpha = 0.7) +
+  
+  # Historical 2-Year Max (The 'Extreme' Baseline)
+  geom_hline(aes(yintercept = roll_max_casi, color = "Hist. 2yr Max"), 
+             linetype = "dotted", size = 0.8) +
+  
   facet_wrap(~sindrome, scales = "free_y", ncol = 3) +
+  
   scale_color_manual(values = c(
-    "Observed" = "gray60", 
-    "GAM (NB)" = "#E41A1C",       # Solid Red
-    "Gaussian Delta" = "#377EB8"  # Dotted Blue
+    "Observed" = "gray70", 
+    "GAM (Seasonal)" = "#E41A1C",   # Red
+    "Static Mean" = "#4DAF4A",      # Green
+    "Hist. 2yr Max" = "#377EB8"     # Blue
   )) +
-  theme_minimal(base_size = 10) +
+  
+  theme_minimal(base_size = 11) +
   theme(legend.position = "bottom",
-        strip.text = element_text(face = "bold")) +
+        strip.text = element_text(face = "bold"),
+        panel.grid.minor = element_blank()) +
   labs(
-    title = "System-Wide Threshold Benchmarking: GAM vs. Gaussian Delta",
-    subtitle = "Faceted comparison showing seasonal smoothing (GAM) vs. reactive volatility (Baseline)",
+    title = "Comparison of Surveillance Thresholds",
+    subtitle = "GAM seasonal thresholds vs. static and historical extreme baselines (Last 180 Days)",
     x = "Date",
-    y = "Daily Cases",
-    color = "Model Type"
+    y = "Daily Case Volume",
+    color = "Threshold Type"
   )
 ```
 
@@ -420,23 +451,45 @@ The summary table displays the most recent week of data for all nine syndromes. 
 - Conf % (Confidence Level): This represents the statistical probability that the observed increase is not due to random chance. A confidence level of 99% indicates that a spike of this magnitude occurs less than 1% of the time under normal conditions, providing a clear mathematical justification for the alert status.
 
 ```{r dashboard}
+# 1. Prepare the comparison table with the missing conf_level column
 comparison_tab <- results_df |>
   group_by(sindrome) |>
   slice_tail(n = 1) |>
-  # Added conf_level to the selection
-  select(sindrome, Date=Data_inizio_sett, Cases=casi, Exp=expected, 
-         Std_Resid=std_residual, `Conf_%`=conf_level, Status_A=status_A, Status_B=status_B) |>
+  mutate(
+    # Calculate Confidence %: how extreme is this observation?
+    # (1 - p_val) * 100 gives us the percentile ranking
+    `Conf_%` = round((1 - p_val) * 100, 2)
+  ) |>
+  select(sindrome, 
+         Date = Data_inizio_sett, 
+         Cases = casi, 
+         Exp = expected, 
+         Std_Resid = std_residual, 
+         `Conf_%`, 
+         Status_A = status_A, 
+         Status_B = status_B) |>
   mutate(across(where(is.numeric), round, 2))
 
+# 2. Render the Kable table
 kable(comparison_tab, caption = "Latest Week Anomaly Detection") |>
   kable_styling(bootstrap_options = c("striped", "hover")) |>
-  # Formatting the new Confidence column to make it stand out
-  column_spec(6, bold = TRUE, color = ifelse(comparison_tab$`Conf_%` > 99, "red", "black")) |>
-  # Shifted original column specs to 7 and 8 because we added a column
+  # Format Confidence column
+  column_spec(6, bold = TRUE, 
+              color = ifelse(comparison_tab$`Conf_%` >= 99, "red", "black")) |>
+  # Approach A Status
   column_spec(7, color = "white", bold = TRUE,
-              background = spec_color(as.numeric(factor(comparison_tab$Status_A, levels=c("GREEN","YELLOW","RED"))), end = 0.9, option = "D")) |>
+              background = case_when(
+                comparison_tab$Status_A == "RED" ~ "#d62728",
+                comparison_tab$Status_A == "YELLOW" ~ "#ff7f0e",
+                TRUE ~ "#2ca02c"
+              )) |>
+  # Approach B Status
   column_spec(8, color = "white", bold = TRUE,
-              background = spec_color(as.numeric(factor(comparison_tab$Status_B, levels=c("GREEN","YELLOW","RED"))), end = 0.9, option = "D"))
+              background = case_when(
+                comparison_tab$Status_B == "RED" ~ "#d62728",
+                comparison_tab$Status_B == "YELLOW" ~ "#ff7f0e",
+                TRUE ~ "#2ca02c"
+              ))
 ```
 
 ### Time-Series Analysis: The Sigma Chart
@@ -464,83 +517,99 @@ ggplot(results_df, aes(x = Data_inizio_sett, y = std_residual)) +
 
 ## Forecasting
 
-The surveillance system extends beyond retrospective analysis to provide Projected Thresholds for the upcoming week. By projecting the current trend and seasonal components forward, the model establishes the specific case volumes that will trigger alerts in the next reporting period.
+The surveillance system employs a Hybrid Adaptive Forecast to establish thresholds for the upcoming period. This approach is specifically tuned for Burst Detection: it preserves long-term seasonal patterns but prioritizes recent local trends to isolate sudden anomalies from broad epidemic waves.
 
-The forecast identifies the exact number of Emergency Department visits required to reach a Yellow (95th percentile) or Red (99th percentile) status. These projections serve as an early warning baseline, allowing healthcare facilities to anticipate potential surges before they appear in the raw data.
+Seasonal Geometry: The model utilizes General Additive Model (GAM) splines to project the background cyclical patterns (e.g., the historical decline of respiratory cases in late winter).
 
-- Expected Cases: The most likely volume of visits based on the current epidemiological trajectory.
-- Yellow/Red Thresholds: The critical "ceiling" values. If the observed counts in the coming week exceed these numbers, the system will automatically flag the syndrome as anomalous.
+14-Day Adaptive Calibration: To account for the "current reality" without being overwhelmed by seasonal noise, the model calculates a Bias Factor based on the trailing 14 days of observed data. This shorter window allows the model to "absorb" steady seasonal rises quickly, ensuring that alerts are triggered only by sudden, sharp deviations.
+
+Threshold Projection: This factor "shifts" the seasonal curve vertically. The Green, Yellow, and Red risk zones are thus calibrated to the current volume, acting as a high-pass filter that ignores the "slow" seasonal trend to catch "fast" localized bursts.
+
+Note on Reliability: While the model projects a 4-week horizon, the statistical confidence is highest for the immediate 7-day window. The 14-day shift remains static in the projection; therefore, if a new baseline shift occurs mid-month, the later thresholds will require a manual update or a new data refresh.
 
 ```{r forecast-table}
-# Prepare data for next week prediction
-last_date <- max(df_long$Data_inizio_sett)
-next_date <- last_date + weeks(1)
+# 1. Create the base forecast grid (Future 30 days)
+last_obs_date <- max(df_long$Data_inizio_sett, na.rm = TRUE)
+forecast_dates <- seq(last_obs_date + days(1), last_obs_date + days(30), by = "day")
 
-next_week_forecast <- map_dfr(names(results_list), function(s) {
-  # Get model and data for specific syndrome
-  # We extract the model object from the original fit
-  m_data <- results_list[[s]]
-  # Re-fit a temporary model object to use for prediction (or store it in results_list)
-  # For simplicity here, we use the last known state to estimate next week
-  
-  # A more robust way is to store the gam object. 
-  # Let's use the last row of the current results to predict thresholds for next week
-  # based on the assumption that the trend is relatively stable.
-  
-  last_row <- m_data |> slice_tail(n = 1)
-  
-  tibble(
-    Sindrome = s,
-    Date = next_date,
-    Expected_Cases = round(last_row$expected, 1),
-    Yellow_Threshold = ceiling(last_row$limit_95_A),
-    Red_Threshold = ceiling(last_row$limit_99_A)
+forecast_df <- map_dfr(names(models_list), function(s) {
+  new_data <- tibble(
+    Data_inizio_sett = forecast_dates,
+    sindrome = s,
+    week_num = as.integer(as.numeric(Data_inizio_sett - min(df_long$Data_inizio_sett)) / 7),
+    week_of_year = week(Data_inizio_sett),
+    dow = wday(Data_inizio_sett, label = TRUE)
   )
+  new_data$expected <- as.numeric(predict(models_list[[s]], newdata = new_data, type = "response"))
+  return(new_data)
 })
 
-kable(next_week_forecast, caption = "Projected Thresholds for the Upcoming Week") |>
-  kable_styling(bootstrap_options = "striped")
+# 2. Get Thetas and 14-day Bias
+thetas_df <- map_df(names(models_list), function(s) {
+  tibble(sindrome = s, theta_val = models_list[[s]]$family$getTheta(TRUE))
+})
+
+baseline_shift_14 <- results_df %>%
+  group_by(sindrome) %>%
+  slice_tail(n = 14) %>% 
+  summarise(bias_factor = mean(casi) / mean(expected), .groups = "drop")
+
+# 3. Apply Calibration
+forecast_df <- forecast_df %>%
+  left_join(baseline_shift_14, by = "sindrome") %>%
+  left_join(thetas_df, by = "sindrome") %>%
+  mutate(
+    expected_shifted = expected * bias_factor,
+    limit_95 = qnbinom(0.95, mu = expected_shifted, size = theta_val),
+    limit_99 = qnbinom(0.99, mu = expected_shifted, size = theta_val)
+  )
+
+# 4. Table Output
+next_week_forecast <- forecast_df %>%
+  filter(Data_inizio_sett <= last_obs_date + days(7)) %>%
+  group_by(sindrome) %>%
+  summarise(
+    `Next Week` = paste(format(min(Data_inizio_sett), "%d %b"), "-", format(max(Data_inizio_sett), "%d %b")),
+    `Exp. Cases` = round(mean(expected_shifted), 1),
+    `Yellow (95%)` = round(mean(limit_95), 1),
+    `Red (99%)` = round(mean(limit_99), 1),
+    .groups = "drop"
+  )
+
+kable(next_week_forecast, caption = "Adaptive Thresholds: Forecast for the Immediate 7-Day Window") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
 ```
 
 ```{r forecast-plot}
-# Define the 2026 Horizon
-future_dates <- data.frame(
-  Data_inizio_sett = seq(as.Date("2026-01-01"), as.Date("2026-03-16"), by = "day")
-) %>%
-  mutate(
-    # Ensure variables match the model formula
-    week_num = as.integer(as.numeric(Data_inizio_sett - min(df_long$Data_inizio_sett)) / 7),
-    week_of_year = as.numeric(format(Data_inizio_sett, "%U"))
-  )
+# 1. To see the black line, we must bind the observed data WITH the forecast thresholds
+history_plot <- results_df %>%
+  filter(Data_inizio_sett > last_obs_date - days(30)) %>% # Show last month of history
+  select(Data_inizio_sett, sindrome, casi, expected, limit_95 = limit_95_A, limit_99 = limit_99_A) %>%
+  mutate(type = "Observed")
 
-# Generate predictions using the model objects
-forecast_df <- map_dfr(names(models_list), function(s) {
-  m <- models_list[[s]]
-  pred <- predict(m, newdata = future_dates, type = "response")
-  theta <- m$family$getTheta(TRUE)
-  
-  future_dates %>%
-    mutate(
-      sindrome = s,
-      expected = pred,
-      limit_95 = qnbinom(0.95, mu = pred, size = theta),
-      limit_99 = qnbinom(0.99, mu = pred, size = theta)
-    )
-})
+future_plot <- forecast_df %>%
+  select(Data_inizio_sett, sindrome, expected = expected_shifted, limit_95, limit_99) %>%
+  mutate(casi = NA, type = "Forecast")
 
-# Plotting with Shaded Zones
-ggplot(forecast_df, aes(x = Data_inizio_sett)) +
+plot_ready <- bind_rows(history_plot, future_plot)
+
+# 2. Final Plot
+ggplot(plot_ready, aes(x = Data_inizio_sett)) +
   geom_ribbon(aes(ymin = 0, ymax = limit_95, fill = "Safe (Green)"), alpha = 0.2) +
   geom_ribbon(aes(ymin = limit_95, ymax = limit_99, fill = "Alert (Yellow)"), alpha = 0.4) +
   geom_ribbon(aes(ymin = limit_99, ymax = limit_99 * 1.5, fill = "Critical (Red)"), alpha = 0.2) +
+  geom_line(aes(y = casi, color = "Observed Cases"), linewidth = 0.8, na.rm = TRUE) +
+  geom_vline(xintercept = as.numeric(last_obs_date), linetype = "dashed", color = "gray40") +
+  annotate("text", x = last_obs_date, y = Inf, label = "Today ", vjust = 2, hjust = 1.1, size = 3.5, fontface = "italic") +
   facet_wrap(~sindrome, scales = "free_y", ncol = 2) +
   scale_fill_manual(values = c("Safe (Green)" = "#2ca02c", "Alert (Yellow)" = "#ff7f0e", "Critical (Red)" = "#d62728")) +
+  scale_color_manual(values = c("Observed Cases" = "black")) +
   theme_minimal() +
-  labs(title = "Projected Surveillance Thresholds: Q1 2026",
-       subtitle = "Faceted by Syndrome - Shaded areas indicate statistical risk zones",
-       x = "Date", y = "Predicted Cases", fill = "Zone")
+  labs(title = "Adaptive Surveillance Horizon: Burst Detection Mode",
+       subtitle = "Thresholds adjusted via 14-day baseline shift to isolate short-term anomalies.",
+       x = "Reporting Period", y = "Daily ED Visits", fill = "Threshold Level") +
+  theme(legend.position = "bottom")
 ```
-
 
 ## Conclusion
 
