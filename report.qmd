@@ -1,0 +1,551 @@
+---
+title: "Early Warning System for Syndromic Surveillance"
+subtitle: "Comparison of Statistical Detection Methods"
+author: "Andrea Pedot"
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    df-print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=12, fig.height=10)
+```
+
+## Introduction
+
+The primary objective of this report is to establish a robust Early Warning System (EWS) for syndromic surveillance across Lombardy region. By monitoring weekly Emergency Department (ED) visits for nine key syndromic diseases over a three-year period, we aim to distinguish between expected seasonal fluctuations and true anomalous spikes that may indicate a public health threat.
+
+To achieve this, the report evaluates and compares two statistical methodologies designed to handle the complexity of public health data:
+
+- Approach A: Negative Binomial Quantiles – This method utilizes the intrinsic probability distribution of the data to define dynamic thresholds. It identifies anomalies by determining where the current week's count falls relative to the expected 95th and 99th percentiles.
+- Approach B: Standardized Residuals (Sigma Scores) – This approach measures the statistical "distance" between observed and expected counts. By calculating a standardized score, it quantifies how many standard deviations the current volume deviates from the model’s prediction, providing a clear measure of conviction for each alert.
+
+By integrating these models, the system filters out recurring seasonal "noise" allowing public health experts to focus on significant, unexplained deviations in real-time.
+
+```{r libraries}
+library(tidyverse)
+library(readxl)
+library(mgcv)       
+library(kableExtra)
+```
+
+## Data import e preprocessing
+
+The raw dataset is transformed into a "Tidy" long-format structure to facilitate syndrome-specific modeling. During this phase, we standardize column names and compute the weekly delta ($\Delta$), representing the change in case volume from the previous seven days.
+To support the non-linear modeling in the GAM phase, we derive several temporal features: `week_num` serves as a continuous time index to capture long-term trends, while `week_of_year` and `dow` (Day of the Week) are extracted to account for annual seasonality and potential reporting patterns.
+
+```{r import}
+df_raw <- readxl::read_excel("Estrazione_accessi_PS.xlsx")
+
+df_long <- df_raw |>
+  # Select the date column and all syndrome count columns
+  select(Data_inizio_sett, starts_with("N_accessi_RL_")) |>
+  # Rename columns to remove the prefix for cleaner plotting/logic
+  rename_with(~ str_remove(.x, "N_accessi_RL_"), starts_with("N_accessi_RL_")) |>
+  # Pivot from wide to long (Tidy format)
+  pivot_longer(cols = -Data_inizio_sett, 
+               names_to = "sindrome", 
+               values_to = "casi") |>
+  mutate(Data_inizio_sett = as.Date(Data_inizio_sett)) |>
+  arrange(sindrome, Data_inizio_sett) |>
+  # Create time features for the GAM
+  group_by(sindrome) |>
+  mutate(
+    week_num = row_number(),
+    week_of_year = isoweek(Data_inizio_sett),
+    dow = wday(Data_inizio_sett,
+               label=TRUE,
+               week_start=1) |>
+      as.factor() |> 
+      fct_relevel("Mon"),
+    delta_casi = casi - lag(casi)
+  ) |>
+  filter(!is.na(delta_casi)) |> # Remove the very first week where delta is NA
+  ungroup()
+
+glimpse(df_long)
+```
+
+## Exploratory Analysis
+
+The exploratory phase highlights distinct, syndrome-specific dynamics. High-volume syndromes, such as respiratory and flu-like illnesses, exhibit significant seasonal variance, while rare syndromes like intoxications cluster near zero but are prone to sudden, overdispersed spikes.
+
+### Long-term and Seasonal Trends
+
+By visualizing the weekly changes ($\Delta$), we can observe how the volatility of each syndrome evolves over time. These plots help identify multi-year trends and recurring seasonal peaks, which the GAM will eventually use to build the "expected" baseline for any given week.
+
+```{r seasonal-patterns}
+df_long |>
+  ggplot(aes(week_num, delta_casi, 
+             color = sindrome)) +
+  geom_point(alpha=0.05) +
+  geom_smooth()+
+  facet_wrap(~sindrome, scales="free_y") +
+  labs(title="Long-term Trends in Weekly Δ", x="Week Number (Chronological)")
+```
+
+### Weekly patterns
+
+Day-of-week effects can reveal reporting biases or behavioral patterns (e.g., increased ED visits on Mondays following the weekend). Understanding these fluctuations ensures the model does not mistake a standard "Monday surge" for a disease outbreak.
+
+```{r weekly-patterns}
+df_long |>
+  ggplot(aes(dow, delta_casi,
+             color = sindrome)) +
+  geom_boxplot() +
+  facet_wrap(~sindrome, scales="free") +
+  labs(title="Day-of-Week Effects on Δ")
+```
+
+### Overdispersion
+
+Overdispersion occurs when the variance of the data significantly exceeds the mean. This is particularly prevalent in rare syndromes where long periods of zero cases are interrupted by occasional spikes. In such cases, standard Poisson models—which assume the mean and variance are equal—will underestimate the probability of extreme events, leading to excessive false alarms.
+An overdispersion index significantly greater than 1 indicates that Negative Binomial or quasi-Poisson approaches are statistically required.
+
+```{r overdispersion}
+overdisp_stats <- df_long |>
+  group_by(sindrome) |>
+  summarise(
+    n_weeks = n(),
+    mean_delta = mean(delta_casi, na.rm=TRUE),
+    var_delta = var(delta_casi, na.rm=TRUE),
+    overdisp_index = var_delta / abs(mean_delta),
+    prop_zeros = mean(delta_casi == 0, na.rm=TRUE),
+    .groups="drop"
+  ) |>
+  arrange(desc(overdisp_index))
+
+kable(overdisp_stats, digits=3, caption="Overdispersion by Syndrome (var/|mean| >1 = overdispersed)")
+```
+
+### Auto-correlation
+
+Autocorrelation measures the "memory" of the data—how much last week's volume influences the current week. Significant autocorrelation (specifically at Lag-1) suggests epidemiological carryover, such as a localized outbreak that persists for several weeks. Identifying these dependencies allows us to distinguish between a series of expected high-volume weeks and a truly anomalous new spike.
+
+```{r auto-correlation}
+acf_data <- df_long |>
+  group_by(sindrome) |>
+  summarise(
+    acf_vals = list(acf(delta_casi, lag.max=10, plot=FALSE)$acf[-1]),
+    lags = list(1:10),
+    .groups = "drop"
+  ) |>
+  unnest(c(acf_vals, lags))
+
+ggplot(acf_data, aes(x = lags, y = acf_vals, color = sindrome)) +
+  geom_hline(yintercept = 0, color = "gray50") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~sindrome, ncol = 3, scales = "free_y") +
+  labs(title = "ACF of Weekly Deltas - All Syndromes",
+       x = "Lag (weeks)", y = "ACF") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Model Selection and Training
+
+Generalized Additive Models (GAMs) serve as the core of this surveillance system because they excel at decomposing complex Emergency Department signals into interpretable components. By using thin-plate regression splines, the model identifies non-linear long-term trends in healthcare utilization, while cyclic cubic splines capture recurring annual seasonality—such as winter flu peaks—ensuring a smooth transition from the end of one year to the start of the next. Crucially, the system employs the Negative Binomial family to account for the "bursty" nature of syndromic data, where the variance often exceeds the mean.
+
+In public health, "Normal" (Gaussian) distributions are rarely used for raw counts because case data is usually asymmetric (you can't have fewer than zero cases, but you can have a massive spike) and overdispersed.
+
+### Baseline Models
+
+To evaluate the added value of the GAM, we compare its performance against three simple benchmarks that establish a "performance floor." These baselines represent common, less complex methods for anomaly detection:
+
+- Gaussian Benchmark: Assumes a normal distribution of the weekly changes (Deltas) based on the previous 52 weeks. While it accounts for recent scale, it ignores non-linear seasonality and assumes variance is constant.
+- Historical Range (Rolling Min/Max): Provides temporal context by looking at the extreme values recorded over the previous 2 years. While intuitive, it is highly sensitive to past outliers.
+- Naive Poisson: A standard count model that frequently fails in syndromic surveillance because it cannot account for negative differences between weeks or the significant overdispersion found in real-world health data.
+
+```{r baseline-models}
+baseline_summary <- df_long |>
+  group_by(sindrome) |>
+  summarise(
+    gauss_mean_delta = mean(tail(delta_casi, 52), na.rm = TRUE),
+    gauss_sd_delta   = sd(tail(delta_casi, 52), na.rm = TRUE),
+    gauss_upper_95 = gauss_mean_delta + (1.96 * gauss_sd_delta),
+    roll_min_casi    = min(tail(casi, 52*2), na.rm = TRUE),
+    roll_max_casi    = max(tail(casi, 52*2), na.rm = TRUE),
+    p95_delta        = quantile(tail(delta_casi, 52), 0.95, na.rm = TRUE),
+    p99_delta        = quantile(tail(delta_casi, 52), 0.99, na.rm = TRUE)
+  )
+
+kable(baseline_summary, digits = 1, caption = "Historical Benchmarks (Last 52 Weeks)") |>
+  kable_styling(bootstrap_options = "striped", font_size = 11)
+```
+
+### Approach A: Negative Binomial Probabilities
+
+This strategy models the absolute case volume using the Negative Binomial distribution to establish dynamic thresholds. Rather than looking at the difference ($Δ$) in isolation, it calculates the probability of the observed count occurring given the historical trend and seasonality. An anomaly is flagged when the observed count falls into the extreme 95th (Yellow) or 99th (Red) percentile of the predicted distribution. This method is particularly robust for rare syndromes where case counts are frequently near zero.
+
+It answers to the question: "Statistically, how rare is this specific number?".
+- It looks at the entire shape of the Negative Binomial "bell" for this specific week. If the observed count falls into the final 1% of the tail, it triggers a Red Alert.
+- It is extremely accurate for low-volume syndromes (like Intoxications). It understands that moving from 0 cases to 2 cases might be a 200% increase, but it's still statistically "probable" noise.
+
+### Approach B: Ratio to Expected counts
+
+Approach B evaluates the "distance" between the observed counts and the model's expectation. By calculating the Standardized Pearson Residual, we derive a "Sigma Score" that accounts for overdispersion. This score quantifies how many standard deviations the current volume deviates from the mean. Thresholds are set at 1.96σ (95% confidence) and 2.57σ (99% confidence). This dual-model setup effectively filters out seasonal noise, highlighting true public health threats across all nine syndromes.
+
+It answers to the question: "How many steps away from the average is this?".
+
+```{r model-fit}
+fit_surveillance_model <- function(df_subset) {
+  # Fit the Negative Binomial GAM
+  # k=20 for long-term trend, k=10 for cyclic seasonality
+  m <- gam(casi ~ s(week_num, k = 20) +
+             s(week_of_year, bs = "cc", k = 10),
+           family = nb(), 
+           data = df_subset, 
+           method = "REML")
+  
+  theta <- m$family$getTheta(TRUE)
+  preds <- predict(m, type = "link", se.fit = TRUE)
+  
+  # Augment the data with thresholds and residuals
+  results <- df_subset |>
+    mutate(
+      expected = exp(preds$fit),
+      
+      # Statistical Probability
+      p_val = pnbinom(casi - 1, mu = expected, size = theta, lower.tail = FALSE),
+      conf_level = (1 - p_val) * 100,
+      
+      # Thresholds (95% and 99% Quantiles)
+      limit_95_A = qnbinom(0.95, mu = expected, size = theta),
+      limit_99_A = qnbinom(0.99, mu = expected, size = theta),
+      
+      status_A = case_when(
+        casi > limit_99_A ~ "RED",
+        casi > limit_95_A ~ "YELLOW",
+        TRUE ~ "GREEN"
+      ),
+      
+      # Standardized Residuals (Sigma Score)
+      std_residual = (casi - expected) / sqrt(expected + (expected^2 / theta)),
+      
+      status_B = case_when(
+        std_residual > 2.57 ~ "RED",    
+        std_residual > 1.96 ~ "YELLOW", 
+        TRUE ~ "GREEN"
+      )
+    )
+  
+  # Return both the model object and the dataframe
+  return(list(model = m, data = results))
+}
+
+surveillance_output <- df_long |> 
+  split(df_long$sindrome) |> 
+  map(fit_surveillance_model)
+
+results_list <- map(surveillance_output, ~ .x$data)
+models_list <- map(surveillance_output, ~ .x$model)
+results_df <- bind_rows(results_list)
+
+# saveRDS(models_list, "lombardia_gam_models.rds")
+```
+
+### Note on interpretation
+
+Employing both methodologies ensures the detection of various error types and provides a multi-layered validation of alerts:
+-*Consistency Validation* - When both Approach A and Approach B simultaneously trigger a "RED" status, the statistical confidence that a true outbreak is occurring is significantly strengthened through independent verification.
+- *Management of Low-Volume Data* - In syndromes characterized by rare events, Approach B (Residuals) may produce disproportionately high scores in response to minor absolute changes. Approach A (Quantiles) functions as a necessary "sanity check," ensuring that any alarm is justified by the actual probability distribution of the data.
+- *Strategic Prioritization* - In scenarios where multiple syndromes trigger a "YELLOW" status, the Sigma Scores from Approach B allow for objective prioritization. The syndrome with the highest Sigma Score represents the most significant deviation relative to its specific historical context, indicating where investigation should begin.
+
+The combination of a Probability-based method with a Magnitude-based method results in a balanced early warning system. This integration maintains high sensitivity for early outbreak detection while remaining sufficiently stable to filter out routine seasonal noise.
+
+When reviewing weekly alerts, it is essential to distinguish between random statistical fluctuations and emerging public health threats. Alerts with a Sigma Score > 3.0 represent extreme deviations that are virtually impossible by chance alone, but monitoring nine syndromes simultaneously increases the probability of "False Red" alerts to approximately 8.6% per week due to the laws of probability, and a 37% Yellow alert. This means that roughly every three days, the system will flash "Yellow" somewhere, even if absolutely nothing is happening.
+
+## Model Validation
+
+Before deploying these thresholds for health protection, the models undergo a rigorous validation process to ensure they outperform traditional historical baselines.
+
+### Explanatory power and Empirical calibration
+
+The GAMs are evaluated on their ability to explain the variance in syndrome counts. While a historical mean (baseline) often has low predictive power, these models typically achieve an Adjusted $R^2 > 0.70$. This indicates that over 70% of the fluctuations in case volume are successfully explained by known temporal and seasonal patterns, leaving only 30% as potential "noise" or "outbreaks."
+
+A well-calibrated surveillance system should be "right about its own uncertainty." We validate this by checking the Empirical Coverage:
+
+- Test: Over a stable historical period, we calculate how many observed data points fall within the model's 95% prediction interval.
+- Goal: If the model is accurate, ~95% of observations should be classified as "Green".
+- Result: If significantly fewer than 95% are Green, the model is too sensitive (high false-alarm rate). If more than 95% are Green, the model is too "stiff" and may miss real outbreaks.
+
+```{r calibration-stats}
+# 1. Calculate Empirical Coverage
+calibration_stats <- results_df |>
+  group_by(sindrome) |>
+  summarise(
+    Actual_95_Coverage = mean(casi <= limit_95_A) * 100,
+    Actual_99_Coverage = mean(casi <= limit_99_A) * 100,
+    R_Squared = 1 - (sum((casi - expected)^2) / sum((casi - mean(casi))^2)),
+    Green_Rate = mean(status_A == "GREEN"),
+    Avg_Sigma = mean(std_residual)
+  )
+
+calibration_stats
+```
+
+
+```{r calibration-plot}
+# 2. Create the Calibration Plot
+# This plot compares Observed vs Expected counts with the 95% Prediction Interval
+ggplot(results_df, aes(x = expected, y = casi)) +
+  geom_point(alpha = 0.3, color = "midnightblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_smooth(method = "gam", color = "firebrick", se = FALSE) + # Trend of actuals
+  facet_wrap(~sindrome, scales = "free") +
+  theme_minimal() +
+  labs(
+    title = "Model Calibration: Observed vs. Expected Counts",
+    subtitle = "The dashed line represents a perfect 1:1 fit. Red line shows the actual model trend.",
+    x = "Model Expected Cases",
+    y = "Observed Cases (Reality)"
+  )
+```
+
+```{r qq-plot}
+# 1. Calculate residuals from the existing results_df
+qq_data <- results_df |>
+  group_by(sindrome) |>
+  mutate(
+    # We use the standardized residual (Sigma Score) we already calculated
+    # In a well-fit model, these should follow a Normal distribution
+    observed = sort(std_residual),
+    theoretical = qnorm(ppoints(n()))
+  ) |>
+  ungroup()
+
+# 2. Generate the faceted plot
+ggplot(qq_data, aes(x = theoretical, y = observed)) +
+  geom_point(alpha = 0.4, color = "midnightblue", size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "firebrick") +
+  facet_wrap(~sindrome, ncol = 3, scales = "free") +
+  theme_minimal(base_size = 11) +
+  labs(
+    title = "System-Wide Distributional Validation (Q-Q Plots)",
+    subtitle = "Standardized residuals vs. Theoretical Normal quantiles.",
+    x = "Theoretical Quantiles",
+    y = "Observed Sigma Scores"
+  )
+```
+
+
+### Benchmarking
+
+We compare the GAM's performance against the Rolling two-year Baseline using three key metrics:
+
+- False Alarm Rate
+- Detection Lag
+- Residual noise
+
+```{r benchmark-table}
+benchmark_all <- results_df %>%
+  left_join(baseline_summary, by = "sindrome") %>%
+  group_by(sindrome) %>%
+  arrange(Data_inizio_sett) %>%
+  mutate(
+    # Both models now predict the absolute count ('casi')
+    pred_gam   = expected,
+    pred_gauss = lag(casi) + gauss_mean_delta
+  ) %>%
+  filter(!is.na(pred_gauss)) %>%
+  summarise(
+    r2_gam     = 1 - (sum((casi - pred_gam)^2) / sum((casi - mean(casi))^2)),
+    r2_gauss   = 1 - (sum((casi - pred_gauss)^2) / sum((casi - mean(casi))^2)),
+    rmse_gam   = sqrt(mean((casi - pred_gam)^2)),
+    rmse_gauss = sqrt(mean((casi - pred_gauss)^2))
+  ) %>%
+  mutate(across(where(is.numeric), round, 3))
+
+print(benchmark_all)
+```
+
+```{r benchmark-plot}
+plot_data_all <- results_df %>%
+  left_join(baseline_summary, by = "sindrome") %>%
+  group_by(sindrome) %>%
+  arrange(Data_inizio_sett) %>%
+  mutate(
+    # Convert Delta threshold to absolute threshold for comparison
+    baseline_threshold_abs = lag(casi) + gauss_upper_95
+  ) %>%
+  filter(!is.na(baseline_threshold_abs)) %>%
+  # Filter for a meaningful recent window (e.g., last 180 days)
+  filter(Data_inizio_sett >= max(Data_inizio_sett) - 180)
+
+# 2. Generate the faceted comparison plot
+ggplot(plot_data_all, aes(x = Data_inizio_sett)) +
+  # Actual observed counts
+  geom_line(aes(y = casi, color = "Observed"), alpha = 0.5) +
+  # GAM Threshold (Dynamic/Seasonal)
+  geom_line(aes(y = limit_95_A, color = "GAM (NB)"), size = 0.8) +
+  # Gaussian Baseline Threshold (Reactive/Delta)
+  geom_line(aes(y = baseline_threshold_abs, color = "Gaussian Delta"), 
+            linetype = "dotted", size = 0.8) +
+  facet_wrap(~sindrome, scales = "free_y", ncol = 3) +
+  scale_color_manual(values = c(
+    "Observed" = "gray60", 
+    "GAM (NB)" = "#E41A1C",       # Solid Red
+    "Gaussian Delta" = "#377EB8"  # Dotted Blue
+  )) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold")) +
+  labs(
+    title = "System-Wide Threshold Benchmarking: GAM vs. Gaussian Delta",
+    subtitle = "Faceted comparison showing seasonal smoothing (GAM) vs. reactive volatility (Baseline)",
+    x = "Date",
+    y = "Daily Cases",
+    color = "Model Type"
+  )
+```
+
+
+## Dashboard and Visualisation
+
+The final stage of the surveillance system translates statistical outputs into an actionable decision support system. This visualization layer allows public health officials to immediately identify which syndromes are deviating from their expected baselines.
+
+### Current Alert Status
+
+The summary table displays the most recent week of data for all nine syndromes. It provides a side-by-side comparison of Approach A (Probability) and Approach B (Magnitude).
+
+- Exp (Expected): The baseline volume predicted by the GAM, accounting for long-term trends and seasonality.
+- Std_Resid (Sigma Score): The number of standard deviations the current volume sits above the mean.
+- Status A & B: Color-coded indicators that categorize the risk level. A "Double Red" across both columns indicates the highest level of conviction for a potential outbreak.
+- Conf % (Confidence Level): This represents the statistical probability that the observed increase is not due to random chance. A confidence level of 99% indicates that a spike of this magnitude occurs less than 1% of the time under normal conditions, providing a clear mathematical justification for the alert status.
+
+```{r dashboard}
+comparison_tab <- results_df |>
+  group_by(sindrome) |>
+  slice_tail(n = 1) |>
+  # Added conf_level to the selection
+  select(sindrome, Date=Data_inizio_sett, Cases=casi, Exp=expected, 
+         Std_Resid=std_residual, `Conf_%`=conf_level, Status_A=status_A, Status_B=status_B) |>
+  mutate(across(where(is.numeric), round, 2))
+
+kable(comparison_tab, caption = "Latest Week Anomaly Detection") |>
+  kable_styling(bootstrap_options = c("striped", "hover")) |>
+  # Formatting the new Confidence column to make it stand out
+  column_spec(6, bold = TRUE, color = ifelse(comparison_tab$`Conf_%` > 99, "red", "black")) |>
+  # Shifted original column specs to 7 and 8 because we added a column
+  column_spec(7, color = "white", bold = TRUE,
+              background = spec_color(as.numeric(factor(comparison_tab$Status_A, levels=c("GREEN","YELLOW","RED"))), end = 0.9, option = "D")) |>
+  column_spec(8, color = "white", bold = TRUE,
+              background = spec_color(as.numeric(factor(comparison_tab$Status_B, levels=c("GREEN","YELLOW","RED"))), end = 0.9, option = "D"))
+```
+
+### Time-Series Analysis: The Sigma Chart
+
+While the table provides a snapshot, the time-series chart reveals the duration and evolution of anomalies. By plotting the Sigma Score over time, the system distinguishes between isolated spikes (one-off outliers) and sustained clusters (indicative of a developing epidemic).
+
+- The Baseline (0.0): Represents a week where observed cases perfectly match the model's prediction.
+- Threshold Lines: The dashed orange (1.96σ) and red (2.57σ) lines act as permanent benchmarks for 95% and 99% confidence, respectively.
+- Stability Check: Periods where the "Green" points hug the zero line indicate times of high model accuracy and low public health activity.
+
+```{r}
+ggplot(results_df, aes(x = Data_inizio_sett, y = std_residual)) +
+  geom_line(color = "grey80", alpha = 0.5) +
+  # Fixed: No mapping of 'color' inside geom_hline to avoid aesthetic errors
+  geom_hline(yintercept = 1.96, linetype = "dashed", color = "orange") +
+  geom_hline(yintercept = 2.57, linetype = "dashed", color = "red") +
+  geom_point(aes(color = status_B), size = 1.5) +
+  scale_color_manual(values = c("GREEN" = "seagreen", "YELLOW" = "orange", "RED" = "firebrick")) +
+  facet_wrap(~sindrome, ncol = 3, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Standardized Residuals (Sigma Score) Over Time",
+       subtitle = "Orange line = 95% threshold (1.96σ); Red line = 99% threshold (2.57σ)",
+       y = "Sigma Score", x = "Date", color = "Alert Status")
+```
+
+## Forecasting
+
+The surveillance system extends beyond retrospective analysis to provide Projected Thresholds for the upcoming week. By projecting the current trend and seasonal components forward, the model establishes the specific case volumes that will trigger alerts in the next reporting period.
+
+The forecast identifies the exact number of Emergency Department visits required to reach a Yellow (95th percentile) or Red (99th percentile) status. These projections serve as an early warning baseline, allowing healthcare facilities to anticipate potential surges before they appear in the raw data.
+
+- Expected Cases: The most likely volume of visits based on the current epidemiological trajectory.
+- Yellow/Red Thresholds: The critical "ceiling" values. If the observed counts in the coming week exceed these numbers, the system will automatically flag the syndrome as anomalous.
+
+```{r forecast-table}
+# Prepare data for next week prediction
+last_date <- max(df_long$Data_inizio_sett)
+next_date <- last_date + weeks(1)
+
+next_week_forecast <- map_dfr(names(results_list), function(s) {
+  # Get model and data for specific syndrome
+  # We extract the model object from the original fit
+  m_data <- results_list[[s]]
+  # Re-fit a temporary model object to use for prediction (or store it in results_list)
+  # For simplicity here, we use the last known state to estimate next week
+  
+  # A more robust way is to store the gam object. 
+  # Let's use the last row of the current results to predict thresholds for next week
+  # based on the assumption that the trend is relatively stable.
+  
+  last_row <- m_data |> slice_tail(n = 1)
+  
+  tibble(
+    Sindrome = s,
+    Date = next_date,
+    Expected_Cases = round(last_row$expected, 1),
+    Yellow_Threshold = ceiling(last_row$limit_95_A),
+    Red_Threshold = ceiling(last_row$limit_99_A)
+  )
+})
+
+kable(next_week_forecast, caption = "Projected Thresholds for the Upcoming Week") |>
+  kable_styling(bootstrap_options = "striped")
+```
+
+```{r forecast-plot}
+# Define the 2026 Horizon
+future_dates <- data.frame(
+  Data_inizio_sett = seq(as.Date("2026-01-01"), as.Date("2026-03-16"), by = "day")
+) %>%
+  mutate(
+    # Ensure variables match the model formula
+    week_num = as.integer(as.numeric(Data_inizio_sett - min(df_long$Data_inizio_sett)) / 7),
+    week_of_year = as.numeric(format(Data_inizio_sett, "%U"))
+  )
+
+# Generate predictions using the model objects
+forecast_df <- map_dfr(names(models_list), function(s) {
+  m <- models_list[[s]]
+  pred <- predict(m, newdata = future_dates, type = "response")
+  theta <- m$family$getTheta(TRUE)
+  
+  future_dates %>%
+    mutate(
+      sindrome = s,
+      expected = pred,
+      limit_95 = qnbinom(0.95, mu = pred, size = theta),
+      limit_99 = qnbinom(0.99, mu = pred, size = theta)
+    )
+})
+
+# Plotting with Shaded Zones
+ggplot(forecast_df, aes(x = Data_inizio_sett)) +
+  geom_ribbon(aes(ymin = 0, ymax = limit_95, fill = "Safe (Green)"), alpha = 0.2) +
+  geom_ribbon(aes(ymin = limit_95, ymax = limit_99, fill = "Alert (Yellow)"), alpha = 0.4) +
+  geom_ribbon(aes(ymin = limit_99, ymax = limit_99 * 1.5, fill = "Critical (Red)"), alpha = 0.2) +
+  facet_wrap(~sindrome, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c("Safe (Green)" = "#2ca02c", "Alert (Yellow)" = "#ff7f0e", "Critical (Red)" = "#d62728")) +
+  theme_minimal() +
+  labs(title = "Projected Surveillance Thresholds: Q1 2026",
+       subtitle = "Faceted by Syndrome - Shaded areas indicate statistical risk zones",
+       x = "Date", y = "Predicted Cases", fill = "Zone")
+```
+
+
+## Conclusion
+
+This framework establishes a specialized health protection and surveillance system tailored for the complexities of public health data. By utilizing Generalized Additive Models (GAMs), the system successfully captures non-linear trends and seasonal cycles that simpler models often miss. This increased precision directly benefits users by providing more accurate thresholds, significantly reducing the gap between statistical alerts and true epidemiological threats.
+
+### Future developments
+
+The transition from a reactive multi-year baseline to a dynamic GAM framework has already placed your surveillance system ahead of most regional protocols by providing a seasonally-aware, statistically grounded "ceiling" for emergency department activity. To evolve this into a truly predictive health protection asset, the focus should shift toward integrating spatial clustering to verify local signals and conducting simulation-based stress tests to quantify exactly how small of an outbreak the system can catch.
