@@ -2,6 +2,8 @@
 title: "Early Warning System for Syndromic Surveillance"
 subtitle: "Predictive Epidemiological Detection & Outbreak Tracking"
 author: "Andrea Pedot"
+params:
+  area: "Lombardia" # Options: Lombardia, Milano, Valtellina
 format:
   html:
     theme: flatly
@@ -21,8 +23,8 @@ The primary objective of this report is to establish a robust Early Warning Syst
 
 To achieve this, the report evaluates and compares two statistical methodologies designed to handle the complexity of public health data:
 
-- Approach A: Negative Binomial Quantiles – This method utilizes the intrinsic probability distribution of the data to define dynamic thresholds. It identifies anomalies by determining where the current week's count falls relative to the expected 95th and 99th percentiles.
-- Approach B: Standardized Residuals (Sigma Scores) – This approach measures the statistical "distance" between observed and expected counts. By calculating a standardized score, it quantifies how many standard deviations the current volume deviates from the model’s prediction, providing a clear measure of conviction for each alert.
+-   Approach A: Negative Binomial Quantiles – This method utilizes the intrinsic probability distribution of the data to define dynamic thresholds. It identifies anomalies by determining where the current week's count falls relative to the expected 95th and 99th percentiles.
+-   Approach B: Standardized Residuals (Sigma Scores) – This approach measures the statistical "distance" between observed and expected counts. By calculating a standardized score, it quantifies how many standard deviations the current volume deviates from the model’s prediction, providing a clear measure of conviction for each alert.
 
 By integrating these models, the system filters out recurring seasonal "noise" allowing public health experts to focus on significant, unexplained deviations in real-time.
 
@@ -35,39 +37,45 @@ library(kableExtra)
 
 ## Data import e preprocessing
 
-The raw dataset is transformed into a "Tidy" long-format structure to facilitate syndrome-specific modeling. During this phase, we standardize column names and compute the weekly delta ($\Delta$), representing the change in case volume from the previous seven days.
-To support the non-linear modeling in the GAM phase, we derive several temporal features: `week_num` serves as a continuous time index to capture long-term trends, while `week_of_year` and `dow` (Day of the Week) are extracted to account for annual seasonality and potential reporting patterns.
+The raw dataset is transformed into a "Tidy" long-format structure to facilitate syndrome-specific modeling. During this phase, we standardize column names and compute the weekly delta ($\Delta$), representing the change in case volume from the previous seven days. To support the non-linear modeling in the GAM phase, we derive several temporal features: `week_num` serves as a continuous time index to capture long-term trends, while `week_of_year` and `dow` (Day of the Week) are extracted to account for annual seasonality and potential reporting patterns.
 
 ```{r import}
+# Map the parameter to the Excel column prefix
+prefix_map <- c(
+  "Lombardia"  = "N_accessi_RL_",
+  "Milano"     = "N_accessi_ASST_Milanesi_",
+  "Valtellina" = "N_accessi_ASST_Valtellina_"
+)
+
+# Get the prefix based on the parameter chosen
+selected_prefix <- prefix_map[params$area]
+
 df_raw <- readxl::read_excel("Estrazione_accessi_PS.xlsx")
 
 df_long <- df_raw |>
-  # Select the date column and all syndrome count columns
-  select(Data_inizio_sett, starts_with("N_accessi_RL_")) |>
-  # Rename columns to remove the prefix for cleaner plotting/logic
-  rename_with(~ str_remove(.x, "N_accessi_RL_"), starts_with("N_accessi_RL_")) |>
-  # Pivot from wide to long (Tidy format)
+  # Select the date column and columns starting with our dynamic prefix
+  select(Data_inizio_sett, starts_with(selected_prefix)) |>
+  # Rename columns to remove that specific prefix
+  rename_with(~ str_remove(.x, selected_prefix), starts_with(selected_prefix)) |>
+  # Pivot from wide to long
   pivot_longer(cols = -Data_inizio_sett, 
                names_to = "sindrome", 
                values_to = "casi") |>
   mutate(Data_inizio_sett = as.Date(Data_inizio_sett)) |>
   arrange(sindrome, Data_inizio_sett) |>
-  # Create time features for the GAM
   group_by(sindrome) |>
   mutate(
     week_num = row_number(),
     week_of_year = isoweek(Data_inizio_sett),
-    dow = wday(Data_inizio_sett,
-               label=TRUE,
-               week_start=1) |>
-      as.factor() |> 
-      fct_relevel("Mon"),
+    dow = wday(Data_inizio_sett, label=TRUE, week_start=1) |> 
+          as.factor() |> fct_relevel("Mon"),
     delta_casi = casi - lag(casi)
   ) |>
-  filter(!is.na(delta_casi)) |> # Remove the very first week where delta is NA
+  filter(!is.na(delta_casi)) |> 
   ungroup()
 
-glimpse(df_long)
+# Update the Introduction title dynamically
+cat("### Analysis for Area: ", params$area)
 ```
 
 ## Exploratory Analysis
@@ -103,8 +111,7 @@ df_long |>
 
 ### Overdispersion
 
-Overdispersion occurs when the variance of the data significantly exceeds the mean. This is particularly prevalent in rare syndromes where long periods of zero cases are interrupted by occasional spikes. In such cases, standard Poisson models—which assume the mean and variance are equal—will underestimate the probability of extreme events, leading to excessive false alarms.
-An overdispersion index significantly greater than 1 indicates that Negative Binomial or quasi-Poisson approaches are statistically required.
+Overdispersion occurs when the variance of the data significantly exceeds the mean. This is particularly prevalent in rare syndromes where long periods of zero cases are interrupted by occasional spikes. In such cases, standard Poisson models—which assume the mean and variance are equal—will underestimate the probability of extreme events, leading to excessive false alarms. An overdispersion index significantly greater than 1 indicates that Negative Binomial or quasi-Poisson approaches are statistically required.
 
 ```{r overdispersion}
 overdisp_stats <- df_long |>
@@ -158,9 +165,9 @@ In public health, "Normal" (Gaussian) distributions are rarely used for raw coun
 
 To evaluate the added value of the GAM, we compare its performance against three simple benchmarks that establish a "performance floor." These baselines represent common, less complex methods for anomaly detection:
 
-- Gaussian Benchmark: Assumes a normal distribution of the weekly changes (Deltas) based on the previous 52 weeks. While it accounts for recent scale, it ignores non-linear seasonality and assumes variance is constant.
-- Historical Range (Rolling Min/Max): Provides temporal context by looking at the extreme values recorded over the previous 2 years. While intuitive, it is highly sensitive to past outliers.
-- Naive Poisson: A standard count model that frequently fails in syndromic surveillance because it cannot account for negative differences between weeks or the significant overdispersion found in real-world health data.
+-   Gaussian Benchmark: Assumes a normal distribution of the weekly changes (Deltas) based on the previous 52 weeks. While it accounts for recent scale, it ignores non-linear seasonality and assumes variance is constant.
+-   Historical Range (Rolling Min/Max): Provides temporal context by looking at the extreme values recorded over the previous 2 years. While intuitive, it is highly sensitive to past outliers.
+-   Naive Poisson: A standard count model that frequently fails in syndromic surveillance because it cannot account for negative differences between weeks or the significant overdispersion found in real-world health data.
 
 ```{r baseline-models}
 baseline_summary <- df_long |>
@@ -190,9 +197,7 @@ kable(baseline_summary, digits = 1, caption = "Historical Benchmarks (Last 52 We
 
 This strategy models the absolute case volume using the Negative Binomial distribution to establish dynamic thresholds. Rather than looking at the difference ($Δ$) in isolation, it calculates the probability of the observed count occurring given the historical trend and seasonality. An anomaly is flagged when the observed count falls into the extreme 95th (Yellow) or 99th (Red) percentile of the predicted distribution. This method is particularly robust for rare syndromes where case counts are frequently near zero.
 
-It answers to the question: "Statistically, how rare is this specific number?".
-- It looks at the entire shape of the Negative Binomial "bell" for this specific week. If the observed count falls into the final 1% of the tail, it triggers a Red Alert.
-- It is extremely accurate for low-volume syndromes (like Intoxications). It understands that moving from 0 cases to 2 cases might be a 200% increase, but it's still statistically "probable" noise.
+It answers to the question: "Statistically, how rare is this specific number?". - It looks at the entire shape of the Negative Binomial "bell" for this specific week. If the observed count falls into the final 1% of the tail, it triggers a Red Alert. - It is extremely accurate for low-volume syndromes (like Intoxications). It understands that moving from 0 cases to 2 cases might be a 200% increase, but it's still statistically "probable" noise.
 
 ### Approach B: Ratio to Expected counts
 
@@ -250,19 +255,15 @@ results_df <- bind_rows(results_list)
 
 ### Note on interpretation
 
-Employing both methodologies ensures the detection of various error types and provides a multi-layered validation of alerts:
--*Consistency Validation* - When both Approach A and Approach B simultaneously trigger a "RED" status, the statistical confidence that a true outbreak is occurring is significantly strengthened through independent verification.
-- *Management of Low-Volume Data* - In syndromes characterized by rare events, Approach B (Residuals) may produce disproportionately high scores in response to minor absolute changes. Approach A (Quantiles) functions as a necessary "sanity check," ensuring that any alarm is justified by the actual probability distribution of the data.
-- *Strategic Prioritization* - In scenarios where multiple syndromes trigger a "YELLOW" status, the Sigma Scores from Approach B allow for objective prioritization. The syndrome with the highest Sigma Score represents the most significant deviation relative to its specific historical context, indicating where investigation should begin.
+Employing both methodologies ensures the detection of various error types and provides a multi-layered validation of alerts: -*Consistency Validation* - When both Approach A and Approach B simultaneously trigger a "RED" status, the statistical confidence that a true outbreak is occurring is significantly strengthened through independent verification. - *Management of Low-Volume Data* - In syndromes characterized by rare events, Approach B (Residuals) may produce disproportionately high scores in response to minor absolute changes. Approach A (Quantiles) functions as a necessary "sanity check," ensuring that any alarm is justified by the actual probability distribution of the data. - *Strategic Prioritization* - In scenarios where multiple syndromes trigger a "YELLOW" status, the Sigma Scores from Approach B allow for objective prioritization. The syndrome with the highest Sigma Score represents the most significant deviation relative to its specific historical context, indicating where investigation should begin.
 
 The combination of a Probability-based method with a Magnitude-based method results in a balanced early warning system. This integration maintains high sensitivity for early outbreak detection while remaining sufficiently stable to filter out routine seasonal noise.
 
-When reviewing weekly alerts, it is essential to distinguish between random statistical fluctuations and emerging public health threats. Alerts with a Sigma Score > 3.0 represent extreme deviations that are virtually impossible by chance alone, but monitoring nine syndromes simultaneously increases the probability of "False Red" alerts to approximately 8.6% per week due to the laws of probability, and a 37% Yellow alert. This means that roughly every three days, the system will flash "Yellow" somewhere, even if absolutely nothing is happening.
+When reviewing weekly alerts, it is essential to distinguish between random statistical fluctuations and emerging public health threats. Alerts with a Sigma Score \> 3.0 represent extreme deviations that are virtually impossible by chance alone, but monitoring nine syndromes simultaneously increases the probability of "False Red" alerts to approximately 8.6% per week due to the laws of probability, and a 37% Yellow alert. This means that roughly every three days, the system will flash "Yellow" somewhere, even if absolutely nothing is happening.
 
 ### Diagnostic plots
 
 This section evaluates the structural integrity of the GAMs using a basis dimension ($k$) check. We compare the Effective Degrees of Freedom (EDF) against the maximum available knots ($k'$); an EDF significantly lower than the limit suggests the model has successfully identified an optimal smoothing level, while an EDF nearing the limit indicates a "ceiling effect" where the model is attempting to capture high-frequency noise or jagged spikes inherent in daily ED data. While low p-values often persist due to non-smooth human behaviors and reporting artifacts, they do not necessarily invalidate the model’s utility as a robust surveillance baseline, provided the overall trend captures the seasonal and weekly cycles effectively.
-
 
 ```{r diagnostic-loop, results='hold'}
 for (s in names(models_list)) {
@@ -281,8 +282,6 @@ for (s in names(models_list)) {
 }
 ```
 
-
-
 ## Model Validation
 
 Before deploying these thresholds for health protection, the models undergo a rigorous validation process to ensure they outperform traditional historical baselines.
@@ -293,9 +292,9 @@ The GAMs are evaluated on their ability to explain the variance in syndrome coun
 
 A well-calibrated surveillance system should be "right about its own uncertainty." We validate this by checking the Empirical Coverage:
 
-- Test: Over a stable historical period, we calculate how many observed data points fall within the model's 95% prediction interval.
-- Goal: If the model is accurate, ~95% of observations should be classified as "Green".
-- Result: If significantly fewer than 95% are Green, the model is too sensitive (high false-alarm rate). If more than 95% are Green, the model is too "stiff" and may miss real outbreaks.
+-   Test: Over a stable historical period, we calculate how many observed data points fall within the model's 95% prediction interval.
+-   Goal: If the model is accurate, \~95% of observations should be classified as "Green".
+-   Result: If significantly fewer than 95% are Green, the model is too sensitive (high false-alarm rate). If more than 95% are Green, the model is too "stiff" and may miss real outbreaks.
 
 ```{r calibration-stats}
 # 1. Calculate Empirical Coverage
@@ -311,7 +310,6 @@ calibration_stats <- results_df |>
 
 calibration_stats
 ```
-
 
 ```{r calibration-plot}
 # 2. Create the Calibration Plot
@@ -356,14 +354,13 @@ ggplot(qq_data, aes(x = theoretical, y = observed)) +
   )
 ```
 
-
 ### Benchmarking
 
 We compare the GAM's performance against the Rolling two-year Baseline using three key metrics:
 
-- False Alarm Rate
-- Detection Lag
-- Residual noise
+-   False Alarm Rate
+-   Detection Lag
+-   Residual noise
 
 ```{r benchmark-table}
 benchmark_all <- results_df %>%
@@ -436,7 +433,6 @@ ggplot(plot_data_all, aes(x = Data_inizio_sett)) +
   )
 ```
 
-
 ## Dashboard and Visualisation
 
 The final stage of the surveillance system translates statistical outputs into an actionable decision support system. This visualization layer allows public health officials to immediately identify which syndromes are deviating from their expected baselines.
@@ -445,10 +441,10 @@ The final stage of the surveillance system translates statistical outputs into a
 
 The summary table displays the most recent week of data for all nine syndromes. It provides a side-by-side comparison of Approach A (Probability) and Approach B (Magnitude).
 
-- Exp (Expected): The baseline volume predicted by the GAM, accounting for long-term trends and seasonality.
-- Std_Resid (Sigma Score): The number of standard deviations the current volume sits above the mean.
-- Status A & B: Color-coded indicators that categorize the risk level. A "Double Red" across both columns indicates the highest level of conviction for a potential outbreak.
-- Conf % (Confidence Level): This represents the statistical probability that the observed increase is not due to random chance. A confidence level of 99% indicates that a spike of this magnitude occurs less than 1% of the time under normal conditions, providing a clear mathematical justification for the alert status.
+-   Exp (Expected): The baseline volume predicted by the GAM, accounting for long-term trends and seasonality.
+-   Std_Resid (Sigma Score): The number of standard deviations the current volume sits above the mean.
+-   Status A & B: Color-coded indicators that categorize the risk level. A "Double Red" across both columns indicates the highest level of conviction for a potential outbreak.
+-   Conf % (Confidence Level): This represents the statistical probability that the observed increase is not due to random chance. A confidence level of 99% indicates that a spike of this magnitude occurs less than 1% of the time under normal conditions, providing a clear mathematical justification for the alert status.
 
 ```{r dashboard}
 # 1. Prepare the comparison table with the missing conf_level column
@@ -496,9 +492,9 @@ kable(comparison_tab, caption = "Latest Week Anomaly Detection") |>
 
 While the table provides a snapshot, the time-series chart reveals the duration and evolution of anomalies. By plotting the Sigma Score over time, the system distinguishes between isolated spikes (one-off outliers) and sustained clusters (indicative of a developing epidemic).
 
-- The Baseline (0.0): Represents a week where observed cases perfectly match the model's prediction.
-- Threshold Lines: The dashed orange (1.96σ) and red (2.57σ) lines act as permanent benchmarks for 95% and 99% confidence, respectively.
-- Stability Check: Periods where the "Green" points hug the zero line indicate times of high model accuracy and low public health activity.
+-   The Baseline (0.0): Represents a week where observed cases perfectly match the model's prediction.
+-   Threshold Lines: The dashed orange (1.96σ) and red (2.57σ) lines act as permanent benchmarks for 95% and 99% confidence, respectively.
+-   Stability Check: Periods where the "Green" points hug the zero line indicate times of high model accuracy and low public health activity.
 
 ```{r}
 ggplot(results_df, aes(x = Data_inizio_sett, y = std_residual)) +
