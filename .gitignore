@@ -8,3 +8,4 @@ report_files
 .httr-oauth
 .DS_Store
 .quarto
+pat.R
