@@ -5,3 +5,6 @@
 *.xlsx
 *.html
 report_files
+.httr-oauth
+.DS_Store
+.quarto
