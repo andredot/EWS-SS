@@ -6,6 +6,7 @@ params:
   area: "Lombardia" # Options: Lombardia, Milano, Valtellina
 format:
   html:
+    embed-resources: true
     theme: flatly
     toc: true
     toc-depth: 2
@@ -496,7 +497,7 @@ While the table provides a snapshot, the time-series chart reveals the duration 
 -   Threshold Lines: The dashed orange (1.96σ) and red (2.57σ) lines act as permanent benchmarks for 95% and 99% confidence, respectively.
 -   Stability Check: Periods where the "Green" points hug the zero line indicate times of high model accuracy and low public health activity.
 
-```{r}
+```{r sigma-chart}
 ggplot(results_df, aes(x = Data_inizio_sett, y = std_residual)) +
   geom_line(color = "grey80", alpha = 0.5) +
   # Fixed: No mapping of 'color' inside geom_hline to avoid aesthetic errors
@@ -613,4 +614,4 @@ This framework establishes a specialized health protection and surveillance syst
 
 ### Future developments
 
-The transition from a reactive multi-year baseline to a dynamic GAM framework has already placed your surveillance system ahead of most regional protocols by providing a seasonally-aware, statistically grounded "ceiling" for emergency department activity. To evolve this into a truly predictive health protection asset, the focus should shift toward integrating spatial clustering to verify local signals and conducting simulation-based stress tests to quantify exactly how small of an outbreak the system can catch.
+The transition from a reactive multi-year baseline to a dynamic GAM framework has already provided a seasonally-aware, statistically grounded "ceiling" for emergency department activity. To evolve this into a truly predictive health protection tool, the focus should shift toward integrating spatial clustering to verify local signals and conducting simulation-based stress tests to quantify exactly how small of an outbreak the system can catch.
