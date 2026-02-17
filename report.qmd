@@ -31,7 +31,6 @@ By integrating these models, the system filters out recurring seasonal "noise" a
 
 ```{r libraries}
 library(tidyverse)
-library(readxl)
 library(mgcv)       
 library(kableExtra)
 ```
@@ -41,41 +40,7 @@ library(kableExtra)
 The raw dataset is transformed into a "Tidy" long-format structure to facilitate syndrome-specific modeling. During this phase, we standardize column names and compute the weekly delta ($\Delta$), representing the change in case volume from the previous seven days. To support the non-linear modeling in the GAM phase, we derive several temporal features: `week_num` serves as a continuous time index to capture long-term trends, while `week_of_year` and `dow` (Day of the Week) are extracted to account for annual seasonality and potential reporting patterns.
 
 ```{r import}
-# Map the parameter to the Excel column prefix
-prefix_map <- c(
-  "Lombardia"  = "N_accessi_RL_",
-  "Milano"     = "N_accessi_ASST_Milanesi_",
-  "Valtellina" = "N_accessi_ASST_Valtellina_"
-)
-
-# Get the prefix based on the parameter chosen
-selected_prefix <- prefix_map[params$area]
-
-df_raw <- readxl::read_excel("Estrazione_accessi_PS.xlsx")
-
-df_long <- df_raw |>
-  # Select the date column and columns starting with our dynamic prefix
-  select(Data_inizio_sett, starts_with(selected_prefix)) |>
-  # Rename columns to remove that specific prefix
-  rename_with(~ str_remove(.x, selected_prefix), starts_with(selected_prefix)) |>
-  # Pivot from wide to long
-  pivot_longer(cols = -Data_inizio_sett, 
-               names_to = "sindrome", 
-               values_to = "casi") |>
-  mutate(Data_inizio_sett = as.Date(Data_inizio_sett)) |>
-  arrange(sindrome, Data_inizio_sett) |>
-  group_by(sindrome) |>
-  mutate(
-    week_num = row_number(),
-    week_of_year = isoweek(Data_inizio_sett),
-    dow = wday(Data_inizio_sett, label=TRUE, week_start=1) |> 
-          as.factor() |> fct_relevel("Mon"),
-    delta_casi = casi - lag(casi)
-  ) |>
-  filter(!is.na(delta_casi)) |> 
-  ungroup()
-
-# Update the Introduction title dynamically
+df_long <- tar_read(clean_data)[[params$area]]
 cat("### Analysis for Area: ", params$area)
 ```
 
@@ -364,9 +329,9 @@ We compare the GAM's performance against the Rolling two-year Baseline using thr
 -   Residual noise
 
 ```{r benchmark-table}
-benchmark_all <- results_df %>%
-  left_join(baseline_summary, by = "sindrome") %>%
-  group_by(sindrome) %>%
+benchmark_all <- results_df |>
+  left_join(baseline_summary, by = "sindrome") |>
+  group_by(sindrome) |>
   summarise(
     # GAM Metrics
     r2_gam         = 1 - (sum((casi - expected)^2) / sum((casi - mean(casi))^2)),
@@ -382,7 +347,7 @@ benchmark_all <- results_df %>%
     rmse_hist_max  = sqrt(mean((casi - roll_max_casi)^2)),
     
     .groups = "drop"
-  ) %>%
+  ) |>
   mutate(across(where(is.numeric), round, 3))
 
 kable(benchmark_all, caption = "System Benchmarking: GAM vs. Static & Historical Baselines") |>
@@ -390,10 +355,10 @@ kable(benchmark_all, caption = "System Benchmarking: GAM vs. Static & Historical
 ```
 
 ```{r benchmark-plot}
-plot_data_all <- results_df %>%
-  left_join(baseline_summary, by = "sindrome") %>%
-  group_by(sindrome) %>%
-  arrange(Data_inizio_sett) %>%
+plot_data_all <- results_df |>
+  left_join(baseline_summary, by = "sindrome") |>
+  group_by(sindrome) |>
+  arrange(Data_inizio_sett) |>
   # Filter for the last 180 days to keep the visual clean
   filter(Data_inizio_sett >= max(Data_inizio_sett) - 180)
 
@@ -546,15 +511,15 @@ thetas_df <- map_df(names(models_list), function(s) {
   tibble(sindrome = s, theta_val = models_list[[s]]$family$getTheta(TRUE))
 })
 
-baseline_shift_14 <- results_df %>%
-  group_by(sindrome) %>%
-  slice_tail(n = 14) %>% 
+baseline_shift_14 <- results_df |>
+  group_by(sindrome) |>
+  slice_tail(n = 14) |> 
   summarise(bias_factor = mean(casi) / mean(expected), .groups = "drop")
 
 # 3. Apply Calibration
-forecast_df <- forecast_df %>%
-  left_join(baseline_shift_14, by = "sindrome") %>%
-  left_join(thetas_df, by = "sindrome") %>%
+forecast_df <- forecast_df |>
+  left_join(baseline_shift_14, by = "sindrome") |>
+  left_join(thetas_df, by = "sindrome") |>
   mutate(
     expected_shifted = expected * bias_factor,
     limit_95 = qnbinom(0.95, mu = expected_shifted, size = theta_val),
@@ -562,9 +527,9 @@ forecast_df <- forecast_df %>%
   )
 
 # 4. Table Output
-next_week_forecast <- forecast_df %>%
-  filter(Data_inizio_sett <= last_obs_date + days(7)) %>%
-  group_by(sindrome) %>%
+next_week_forecast <- forecast_df |>
+  filter(Data_inizio_sett <= last_obs_date + days(7)) |>
+  group_by(sindrome) |>
   summarise(
     `Next Week` = paste(format(min(Data_inizio_sett), "%d %b"), "-", format(max(Data_inizio_sett), "%d %b")),
     `Exp. Cases` = round(mean(expected_shifted), 1),
@@ -579,13 +544,13 @@ kable(next_week_forecast, caption = "Adaptive Thresholds: Forecast for the Immed
 
 ```{r forecast-plot}
 # 1. To see the black line, we must bind the observed data WITH the forecast thresholds
-history_plot <- results_df %>%
-  filter(Data_inizio_sett > last_obs_date - days(30)) %>% # Show last month of history
-  select(Data_inizio_sett, sindrome, casi, expected, limit_95 = limit_95_A, limit_99 = limit_99_A) %>%
+history_plot <- results_df |>
+  filter(Data_inizio_sett > last_obs_date - days(30)) |> # Show last month of history
+  select(Data_inizio_sett, sindrome, casi, expected, limit_95 = limit_95_A, limit_99 = limit_99_A) |>
   mutate(type = "Observed")
 
-future_plot <- forecast_df %>%
-  select(Data_inizio_sett, sindrome, expected = expected_shifted, limit_95, limit_99) %>%
+future_plot <- forecast_df |>
+  select(Data_inizio_sett, sindrome, expected = expected_shifted, limit_95, limit_99) |>
   mutate(casi = NA, type = "Forecast")
 
 plot_ready <- bind_rows(history_plot, future_plot)
