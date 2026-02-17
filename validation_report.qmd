@@ -162,6 +162,18 @@ Based on the validation run above, we can reconstruct exactly when the system wo
 The table below lists days where ALERT (99%) thresholds were exceeded.
 
 ```{r alert-history}
+alerts_history <- val_df |>
+  mutate(
+    Expected = Adaptive_Pred,
+    Threshold_99 = qnbinom(0.99, mu = Expected, size = Theta),
+    Status = case_when(
+      Observed > Threshold_99 ~ "ALERT (99%)",
+      Observed > qnbinom(0.95, mu = Expected, size = Theta) ~ "WATCH (95%)",
+      TRUE ~ "Normal"
+    )
+  ) |>
+  rename(Syndrome = sindrome) # Rename to match the table's expectation
+
 # 1. Prepare Data: Filter for RED alerts only
 table_data <- alerts_history |>
   filter(Status == "ALERT (99%)") |>

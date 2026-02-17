@@ -40,7 +40,9 @@ library(kableExtra)
 The raw dataset is transformed into a "Tidy" long-format structure to facilitate syndrome-specific modeling. During this phase, we standardize column names and compute the weekly delta ($\Delta$), representing the change in case volume from the previous seven days. To support the non-linear modeling in the GAM phase, we derive several temporal features: `week_num` serves as a continuous time index to capture long-term trends, while `week_of_year` and `dow` (Day of the Week) are extracted to account for annual seasonality and potential reporting patterns.
 
 ```{r import}
-df_long <- tar_read(clean_data)[[params$area]]
+all_data <- tar_read(all_data_list)
+df_long <- all_data[[params$area]]
+
 cat("### Analysis for Area: ", params$area)
 ```
 
@@ -80,17 +82,10 @@ df_long |>
 Overdispersion occurs when the variance of the data significantly exceeds the mean. This is particularly prevalent in rare syndromes where long periods of zero cases are interrupted by occasional spikes. In such cases, standard Poisson models—which assume the mean and variance are equal—will underestimate the probability of extreme events, leading to excessive false alarms. An overdispersion index significantly greater than 1 indicates that Negative Binomial or quasi-Poisson approaches are statistically required.
 
 ```{r overdispersion}
-overdisp_stats <- df_long |>
-  group_by(sindrome) |>
-  summarise(
-    n_weeks = n(),
-    mean_delta = mean(delta_casi, na.rm=TRUE),
-    var_delta = var(delta_casi, na.rm=TRUE),
-    overdisp_index = var_delta / abs(mean_delta),
-    prop_zeros = mean(delta_casi == 0, na.rm=TRUE),
-    .groups="drop"
-  ) |>
-  arrange(desc(overdisp_index))
+all_stats <- tar_read(all_stats_list)
+stats_current <- all_stats[[params$area]]
+
+overdisp_stats <- stats_current$overdispersion
 
 kable(overdisp_stats, digits=3, caption="Overdispersion by Syndrome (var/|mean| >1 = overdispersed)")
 ```
@@ -100,14 +95,8 @@ kable(overdisp_stats, digits=3, caption="Overdispersion by Syndrome (var/|mean| 
 Autocorrelation measures the "memory" of the data—how much last week's volume influences the current week. Significant autocorrelation (specifically at Lag-1) suggests epidemiological carryover, such as a localized outbreak that persists for several weeks. Identifying these dependencies allows us to distinguish between a series of expected high-volume weeks and a truly anomalous new spike.
 
 ```{r auto-correlation}
-acf_data <- df_long |>
-  group_by(sindrome) |>
-  summarise(
-    acf_vals = list(acf(delta_casi, lag.max=10, plot=FALSE)$acf[-1]),
-    lags = list(1:10),
-    .groups = "drop"
-  ) |>
-  unnest(c(acf_vals, lags))
+# Extract pre-calculated ACF data
+acf_data <- stats_current$acf
 
 ggplot(acf_data, aes(x = lags, y = acf_vals, color = sindrome)) +
   geom_hline(yintercept = 0, color = "gray50") +
@@ -136,24 +125,9 @@ To evaluate the added value of the GAM, we compare its performance against three
 -   Naive Poisson: A standard count model that frequently fails in syndromic surveillance because it cannot account for negative differences between weeks or the significant overdispersion found in real-world health data.
 
 ```{r baseline-models}
-baseline_summary <- df_long |>
-  group_by(sindrome) |>
-  summarise(
-    # 1. Historical Range (Rolling 2-year Max)
-    # Serves as a 'Safety Ceiling' based on past extremes
-    roll_max_casi    = max(tail(casi, 52*2), na.rm = TRUE),
-    roll_min_casi    = min(tail(casi, 52*2), na.rm = TRUE),
-    
-    # 2. Naive Poisson Expectation
-    # The simplest count baseline: the long-term average
-    poisson_mean     = mean(casi, na.rm = TRUE),
-    
-    # 3. Percentile Benchmarks for Deltas
-    p95_delta        = quantile(tail(delta_casi, 52), 0.95, na.rm = TRUE),
-    p99_delta        = quantile(tail(delta_casi, 52), 0.99, na.rm = TRUE),
-    
-    .groups = "drop"
-  )
+# Load pre-calculated baselines
+all_baselines <- tar_read(all_baselines_list)
+baseline_summary <- all_baselines[[params$area]]
 
 kable(baseline_summary, digits = 1, caption = "Historical Benchmarks (Last 52 Weeks)") |>
   kable_styling(bootstrap_options = "striped", font_size = 11)
