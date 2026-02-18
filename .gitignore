@@ -10,3 +10,4 @@ report_files
 .quarto
 pat.R
 renv
+_targets
