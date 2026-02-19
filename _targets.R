@@ -31,11 +31,11 @@ list(
     report_daily_Lombardia, 
     "report.qmd", 
     params = list(area = "Lombardia"), 
-    output_file = "EWS_Report_Lombardia.html"
+    output_file = "output/EWS_Report_Lombardia.html"
   ),
   tar_render(
     report_val_Lombardia, "validation_report.qmd", 
-    params = list(area = "Lombardia"), output_file = "Validation_Report_Lombardia.html"
+    params = list(area = "Lombardia"), output_file = "output/Validation_Report_Lombardia.html"
   ),
   
   # --- MILANO ---
@@ -43,11 +43,11 @@ list(
     report_daily_Milano, 
     "report.qmd", 
     params = list(area = "Milano"), 
-    output_file = "EWS_Report_Milano.html"
+    output_file = "output/EWS_Report_Milano.html"
   ),
   tar_render(
     report_val_Milano, "validation_report.qmd", 
-    params = list(area = "Milano"), output_file = "Validation_Report_Milano.html"
+    params = list(area = "Milano"), output_file = "output/Validation_Report_Milano.html"
   ),
   
   # --- VALTELLINA ---
@@ -55,10 +55,10 @@ list(
     report_daily_Valtellina, 
     "report.qmd", 
     params = list(area = "Valtellina"), 
-    output_file = "EWS_Report_Valtellina.html"
+    output_file = "output/EWS_Report_Valtellina.html"
   ),
   tar_render(
     report_val_Valtellina, "validation_report.qmd", 
-    params = list(area = "Valtellina"), output_file = "Validation_Report_Valtellina.html"
+    params = list(area = "Valtellina"), output_file = "output/Validation_Report_Valtellina.html"
   )
 )
