@@ -4,13 +4,13 @@ subtitle: "Surveillance Package Baseline Validation: `r params$area`"
 author: "Early Warning System"
 params:
   area: "Lombardia" 
-format:
-  html:
+output:
+  html_document:
     theme: flatly
     toc: true
-    embed-resources: true
-    code-fold: true
-    df-print: paged
+    toc_depth: 2
+    code_folding: hide
+    df_print: paged
 ---
 
 ```{r setup, include=FALSE}

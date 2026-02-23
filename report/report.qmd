@@ -4,14 +4,13 @@ subtitle: "Predictive Epidemiological Detection & Outbreak Tracking"
 author: "Andrea Pedot"
 params:
   area: "Lombardia" # Options: Lombardia, Milano, Valtellina
-format:
-  html:
-    embed-resources: true
+output:
+  html_document:
     theme: flatly
     toc: true
-    toc-depth: 2
-    code-fold: true
-    df-print: paged
+    toc_depth: 2
+    code_folding: hide
+    df_print: paged
 ---
 
 ```{r setup, include=FALSE}
@@ -110,6 +109,13 @@ ggplot(acf_data, aes(x = lags, y = acf_vals, color = sindrome)) +
         axis.text.x = element_text(angle = 45, hjust = 1))
 ```
 
+### Key analysis points from EDA
+
+The modeling approach should be bifurcated to account for the fundamentally different epidemiological behaviors of various health conditions, primarily to prevent the model from overfitting to random noise.
+High-volume, communicable syndromes (such as respiratory or flu-like illnesses) exhibit strong auto-correlation and highly predictable annual cycles. These are modeled with the "full," highly flexible Generalized Additive Model (GAM), which utilizes cyclic annual splines (week_of_year), high-knot long-term trends ($k=20$)
+Conversely, syndromes driven by sporadic, non-communicable, or idiosyncratic events lack these distinct seasonal patterns. If the full GAM is applied to them, the model "chases its own tail"—mistaking a random, short-term cluster of cases for the start of a seasonal wave, which creates erratic, bouncing thresholds that generate false alarms. To ensure stable and reliable alerting, these "flat" syndromes—specifically altered states of consciousness (alt_cosc), convulsions (conv), unexpected deaths (dec_gravi), drug intoxications (int_farm), and cutaneous rashes (rash_cut)—are evaluated using a "stiffer" GAM. 
+This rigid model intentionally drops the annual seasonality parameter, heavily restricts the flexibility of the long-term trend ($k=3$), providing a flat, robust statistical ceiling that only triggers an alert during a mathematically genuine anomaly.
+
 ## Model Selection and Training
 
 Generalized Additive Models (GAMs) serve as the core of this surveillance system because they excel at decomposing complex Emergency Department signals into interpretable components. By using thin-plate regression splines, the model identifies non-linear long-term trends in healthcare utilization, while cyclic cubic splines capture recurring annual seasonality—such as winter flu peaks—ensuring a smooth transition from the end of one year to the start of the next. Crucially, the system employs the Negative Binomial family to account for the "bursty" nature of syndromic data, where the variance often exceeds the mean.
@@ -147,14 +153,21 @@ It answers to the question: "How many steps away from the average is this?".
 
 ```{r model-fit}
 fit_surveillance_model <- function(df_subset) {
-  # Reverting to the stable Option 1 configuration
-  m <- mgcv::gam(casi ~ s(week_num, k = 50) + 
-                       s(week_of_year, bs = "cc", k = 12) + 
-                       dow, 
-                 family = nb(), 
-                 data = df_subset, 
-                 method = "REML")
+  fit_syndrome_gam <- function(train_df, syndrome_name, 
+                             flat_syndromes = c("alt_cosc", "conv", "dec_gravi", "int_farm", "rash_cut")) {
+  if (syndrome_name %in% flat_syndromes) {
+    # --- 1A. STIFF MODEL (Low Seasonality/Autocorrelation) ---
+    mgcv::gam(casi ~ s(week_num, bs = "ts", k = 3) + dow,
+              data = train_df, family = mgcv::nb())
+  } else {
+    # --- 1B. FLEXIBLE MODEL (High Seasonality/Autocorrelation) ---
+    mgcv::gam(casi ~ s(week_num, bs = "ts", k = 20) + 
+                s(week_of_year, bs = "cc", k = 12) + dow,
+              data = train_df, family = mgcv::nb())
+  }  }
   
+  s_name <- as.character(df_subset$sindrome[1])
+  m <- fit_syndrome_gam(train_df = df_subset, syndrome_name = s_name)
   theta <- m$family$getTheta(TRUE)
   preds <- predict(m, type = "link", se.fit = TRUE)
   
@@ -182,6 +195,7 @@ fit_surveillance_model <- function(df_subset) {
   return(list(model = m, data = results))
 }
 
+# The mapping remains exactly the same!
 surveillance_output <- df_long |> 
   split(df_long$sindrome) |> 
   map(fit_surveillance_model)
@@ -195,7 +209,11 @@ results_df <- bind_rows(results_list)
 
 ### Note on interpretation
 
-Employing both methodologies ensures the detection of various error types and provides a multi-layered validation of alerts: -*Consistency Validation* - When both Approach A and Approach B simultaneously trigger a "RED" status, the statistical confidence that a true outbreak is occurring is significantly strengthened through independent verification. - *Management of Low-Volume Data* - In syndromes characterized by rare events, Approach B (Residuals) may produce disproportionately high scores in response to minor absolute changes. Approach A (Quantiles) functions as a necessary "sanity check," ensuring that any alarm is justified by the actual probability distribution of the data. - *Strategic Prioritization* - In scenarios where multiple syndromes trigger a "YELLOW" status, the Sigma Scores from Approach B allow for objective prioritization. The syndrome with the highest Sigma Score represents the most significant deviation relative to its specific historical context, indicating where investigation should begin.
+Employing both methodologies ensures the detection of various error types and provides a multi-layered validation of alerts:
+
+-*Consistency Validation* - When both Approach A and Approach B simultaneously trigger a "RED" status, the statistical confidence that a true outbreak is occurring is significantly strengthened through independent verification.
+- *Management of Low-Volume Data* - In syndromes characterized by rare events, Approach B (Residuals) may produce disproportionately high scores in response to minor absolute changes. Approach A (Quantiles) functions as a necessary "sanity check," ensuring that any alarm is justified by the actual probability distribution of the data. 
+- *Strategic Prioritization* - In scenarios where multiple syndromes trigger a "YELLOW" status, the Sigma Scores from Approach B allow for objective prioritization. The syndrome with the highest Sigma Score represents the most significant deviation relative to its specific historical context, indicating where investigation should begin.
 
 The combination of a Probability-based method with a Magnitude-based method results in a balanced early warning system. This integration maintains high sensitivity for early outbreak detection while remaining sufficiently stable to filter out routine seasonal noise.
 
@@ -221,10 +239,6 @@ for (s in names(models_list)) {
   cat("\n")
 }
 ```
-
-## Model Validation
-
-Before deploying these thresholds for health protection, the models undergo a rigorous validation process to ensure they outperform traditional historical baselines.
 
 ### Explanatory power and Empirical calibration
 
@@ -451,7 +465,11 @@ ggplot(results_df, aes(x = Data_inizio_sett, y = std_residual)) +
        y = "Sigma Score", x = "Date", color = "Alert Status")
 ```
 
-## Forecasting
+### Key analytical take-aways
+
+While the current seasonal GAM effectively captures broad historical patterns—such as the expected winter rise in respiratory visits—it rigidly assumes that future epidemics will perfectly adhere to past calendar dates and volumes. In reality, a seasonal wave might arrive weeks early or establish a higher overall "new normal" for that specific year. Without an adaptive mechanism, a severe but slowly building flu season will continuously breach the static historical threshold, generating red alerts every single day for weeks. This creates severe "alert fatigue" for public health officials, rendering the system useless for detecting sudden, localized crises.
+
+## 14-Day Adaptive Calibration
 
 The surveillance system employs a Hybrid Adaptive Forecast to establish thresholds for the upcoming period. This approach is specifically tuned for Burst Detection: it preserves long-term seasonal patterns but prioritizes recent local trends to isolate sudden anomalies from broad epidemic waves.
 

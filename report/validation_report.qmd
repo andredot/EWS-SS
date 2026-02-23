@@ -4,13 +4,13 @@ subtitle: "Retrospective Analysis & Stress Testing: `r params$area`"
 author: "Andrea Pedot"
 params:
   area: "Lombardia" # Options: Lombardia, Milano, Valtellina
-format:
-  html:
+output:
+  html_document:
     theme: flatly
     toc: true
-    embed-resources: true
-    code-fold: true
-    df-print: paged
+    toc_depth: 2
+    code_folding: hide
+    df_print: paged
 ---
 
 ```{r setup, include=FALSE}
