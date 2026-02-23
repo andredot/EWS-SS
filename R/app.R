@@ -9,7 +9,7 @@ library(kableExtra)
 # --- UI Definition ---
 ui <- fluidPage(
   theme = bs_theme(bootswatch = "flatly"),
-  titlePanel("P.E.D.O.T. | Predictive Epidemiological Detection & Outbreak Tracking"),
+  titlePanel("Predictive Epidemiological Detection & Outbreak Tracking"),
   
   sidebarLayout(
     sidebarPanel(
@@ -29,7 +29,7 @@ ui <- fluidPage(
       # 4. Run Button
       actionButton("run", "Run Analysis", class = "btn-primary w-100", icon = icon("play")),
       hr(),
-      helpText("The model trains on data prior to the selected date and calculates Z-Score/P-Values based on a Negative Binomial distribution.")
+      helpText("The model trains on data prior to the selected date and calculates Z-Score/P-Values based on an Adaptive Negative Binomial distribution.")
     ),
     
     mainPanel(
@@ -56,11 +56,11 @@ server <- function(input, output, session) {
   current_data <- reactive({
     req(raw_file_content(), input$region_code)
     
-    df <- raw_file_content() %>%
-      select(Data_inizio_sett, starts_with(input$region_code)) %>%
-      rename_with(~ str_remove(.x, input$region_code), starts_with(input$region_code)) %>%
-      pivot_longer(cols = -Data_inizio_sett, names_to = "syndrome", values_to = "cases") %>%
-      mutate(Data_inizio_sett = as.Date(Data_inizio_sett)) %>%
+    df <- raw_file_content() |>
+      select(Data_inizio_sett, starts_with(input$region_code)) |>
+      rename_with(~ str_remove(.x, input$region_code), starts_with(input$region_code)) |>
+      pivot_longer(cols = -Data_inizio_sett, names_to = "syndrome", values_to = "cases") |>
+      mutate(Data_inizio_sett = as.Date(Data_inizio_sett)) |>
       arrange(syndrome, Data_inizio_sett)
     
     df
@@ -76,44 +76,60 @@ server <- function(input, output, session) {
               max = max(dates))
   })
   
-  # 4. Analysis Engine (Negative Binomial GAM)
+  # 4. Analysis Engine (Adaptive Negative Binomial GAM)
   processed_results <- eventReactive(input$run, {
     req(current_data(), input$target_date)
     
-    df_full <- current_data() %>%
-      filter(Data_inizio_sett <= input$target_date) %>%
-      group_by(syndrome) %>%
+    df_full <- current_data() |>
+      filter(Data_inizio_sett <= input$target_date) |>
+      group_by(syndrome) |>
       mutate(
         week_num = row_number(),
         week_of_year = isoweek(Data_inizio_sett),
-        dow = wday(Data_inizio_sett, label = TRUE, week_start = 1) %>% 
-          as.factor() %>% fct_relevel("Mon")
-      ) %>% ungroup()
+        dow = wday(Data_inizio_sett, label = TRUE, week_start = 1) |> 
+          as.factor() |> fct_relevel("Mon")
+      ) |> ungroup()
     
     syndromes <- unique(df_full$syndrome)
+    flat_syndromes <- c("alt_cosc", "conv", "dec_gravi", "int_farm", "rash_cut")
     results_list <- list()
     
     withProgress(message = 'Calculating statistical metrics...', value = 0, {
       for (i in seq_along(syndromes)) {
         s <- syndromes[i]
         
-        train_df <- df_full %>% filter(syndrome == s & Data_inizio_sett < input$target_date)
-        test_df  <- df_full %>% filter(syndrome == s & Data_inizio_sett == input$target_date)
+        train_df <- df_full |> filter(syndrome == s & Data_inizio_sett < input$target_date)
+        test_df  <- df_full |> filter(syndrome == s & Data_inizio_sett == input$target_date)
         
-        # Fit GAM
-        m <- gam(cases ~ s(week_num, bs = "ts", k = 20) + 
-                   s(week_of_year, bs = "cc", k = 12) + dow,
-                 data = train_df, family = nb())
+        # --- Fit GAM based on Syndrome Type ---
+        if (s %in% flat_syndromes) {
+          # Stiff Model (No seasonality, k=3)
+          m <- gam(cases ~ s(week_num, bs = "ts", k = 3) + dow,
+                   data = train_df, family = nb())
+          bias <- 1 # Frozen baseline
+        } else {
+          # Flexible Model (Annual seasonality, k=20)
+          m <- gam(cases ~ s(week_num, bs = "ts", k = 20) + 
+                     s(week_of_year, bs = "cc", k = 12) + dow,
+                   data = train_df, family = nb())
+          
+          # Adaptive 14-day shift
+          last_14 <- train_df |> tail(14)
+          last_14_pred <- predict(m, newdata = last_14, type = "response")
+          bias <- mean(last_14$cases) / mean(last_14_pred)
+          if(is.na(bias) || is.infinite(bias)) bias <- 1
+        }
         
-        pred <- predict(m, newdata = test_df, type = "response")
         theta <- m$family$getTheta(TRUE)
+        raw_pred <- predict(m, newdata = test_df, type = "response")
+        adaptive_expected <- as.numeric(raw_pred) * bias
         
-        test_df <- test_df %>%
+        test_df <- test_df |>
           mutate(
-            expected = as.numeric(pred),
+            expected = adaptive_expected,
             std_dev_nb = sqrt(expected + (expected^2 / theta)),
             z_mag = (cases - expected) / std_dev_nb,
-            p_val = 1 - pnbinom(cases - 1, mu = expected, size = theta),
+            p_val = pnbinom(cases - 1, mu = expected, size = theta, lower.tail = FALSE),
             pct_dev = ((cases - expected) / expected) * 100,
             
             # Status Logic
@@ -125,7 +141,8 @@ server <- function(input, output, session) {
             theta_val = theta
           )
         
-        results_list[[s]] <- list(test_row = test_df, model = m, history = train_df)
+        # Save bias so the forecast plot can use it!
+        results_list[[s]] <- list(test_row = test_df, model = m, history = train_df, bias = bias)
         incProgress(1/length(syndromes))
       }
     })
@@ -136,7 +153,7 @@ server <- function(input, output, session) {
   output$comparison_tab_ui <- renderUI({
     req(processed_results())
     
-    comparison_tab <- map_dfr(processed_results(), ~ .x$test_row) %>%
+    comparison_tab <- map_dfr(processed_results(), ~ .x$test_row) |>
       select(
         Syndrome = syndrome, 
         Observed = cases, 
@@ -145,7 +162,7 @@ server <- function(input, output, session) {
         `p-val` = p_val, 
         `% Dev` = pct_dev, 
         Status = status
-      ) %>%
+      ) |>
       mutate(
         Expected = round(Expected, 1),
         `Z-Mag` = round(`Z-Mag`, 3),
@@ -156,12 +173,12 @@ server <- function(input, output, session) {
     status_levels <- c("STABLE", "WATCH", "ALERT")
     
     kable(comparison_tab, format = "html", escape = FALSE, align = "c",
-          caption = paste("Surveillance Summary:", input$region_code)) %>%
-      kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
-      column_spec(5, bold = TRUE, color = ifelse(comparison_tab$`p-val` <= 0.05, "red", "black")) %>%
+          caption = paste("Surveillance Summary:", input$region_code)) |>
+      kable_styling(bootstrap_options = c("striped", "hover", "condensed")) |>
+      column_spec(5, bold = TRUE, color = ifelse(comparison_tab$`p-val` <= 0.05, "red", "black")) |>
       column_spec(7, color = "black", bold = TRUE,
                   background = spec_color(as.numeric(factor(comparison_tab$Status, levels=status_levels)), 
-                                          begin = 0.3, end = 0.9, option = "viridis", direction = 1)) %>%
+                                          begin = 0.3, end = 0.9, option = "viridis", direction = 1)) |>
       HTML()
   })
   
@@ -174,6 +191,7 @@ server <- function(input, output, session) {
       h <- res$history
       t <- res$test_row
       theta <- t$theta_val[1]
+      bias <- res$bias # Retrieve the saved bias factor!
       
       # Forecast next 21 days
       future_dates <- seq(input$target_date + 1, input$target_date + 21, by="day")
@@ -182,15 +200,17 @@ server <- function(input, output, session) {
         syndrome = t$syndrome[1],
         week_num = max(h$week_num) + (1:21) + 1,
         week_of_year = isoweek(Data_inizio_sett),
-        dow = wday(Data_inizio_sett, label = TRUE, week_start = 1) %>% as.factor()
+        dow = wday(Data_inizio_sett, label = TRUE, week_start = 1) |> as.factor()
       )
-      future_df$expected <- as.numeric(predict(m, newdata = future_df, type = "response"))
+      
+      # Apply the adaptive bias to the future predictions as well
+      future_df$expected <- as.numeric(predict(m, newdata = future_df, type = "response")) * bias
       
       bind_rows(
-        h %>% filter(Data_inizio_sett >= input$target_date - 21) %>% mutate(type = "History"),
-        t %>% mutate(type = "Target"),
-        future_df %>% mutate(type = "Forecast")
-      ) %>%
+        h |> filter(Data_inizio_sett >= input$target_date - 21) |> mutate(type = "History"),
+        t |> mutate(type = "Target"),
+        future_df |> mutate(type = "Forecast")
+      ) |>
         mutate(
           limit_95 = qnbinom(0.95, mu = expected, size = theta),
           limit_99 = qnbinom(0.99, mu = expected, size = theta)
@@ -210,7 +230,7 @@ server <- function(input, output, session) {
       geom_vline(xintercept = as.numeric(input$target_date), linetype = "dashed", color = "darkred") +
       facet_wrap(~syndrome, scales = "free_y", ncol = 2) +
       # Explicit Color Mapping
-      scale_fill_manual(values = c("STABLE" = "#2ca02c", "WATCH" = "#fdfd37", "ALERT" = "#ff7f0e")) +
+      scale_fill_manual(values = c("STABLE" = "#2A9D8F", "WATCH" = "#E9C46A", "ALERT" = "#BC4749")) +
       scale_x_date(date_labels = "%d %b") +
       theme_minimal() +
       labs(title = paste("P.E.D.O.T. Surveillance Horizon -", input$region_code),
