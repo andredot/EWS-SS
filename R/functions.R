@@ -53,6 +53,30 @@ load_and_process_data <- function(file_path) {
   return(dplyr::bind_rows(all_areas))
 }
 
+#' Fit GAM Model based on Syndrome Type
+#'
+#' Automatically selects the appropriate GAM flexibility based on 
+#' whether the syndrome is highly seasonal or flat/random.
+#'
+#' @param train_df Dataframe containing the historical training data.
+#' @param syndrome_name Character string of the current syndrome.
+#' @param flat_syndromes Character vector of syndromes that require a stiff model.
+#' @return A fitted mgcv::gam object.
+#' @export
+fit_syndrome_gam <- function(train_df, syndrome_name, 
+                             flat_syndromes = c("alt_cosc", "conv", "dec_gravi", "int_farm", "rash_cut")) {
+  if (syndrome_name %in% flat_syndromes) {
+    # --- 1A. STIFF MODEL (Low Seasonality/Autocorrelation) ---
+    mgcv::gam(casi ~ s(week_num, bs = "ts", k = 3) + dow,
+              data = train_df, family = mgcv::nb())
+  } else {
+    # --- 1B. FLEXIBLE MODEL (High Seasonality/Autocorrelation) ---
+    mgcv::gam(casi ~ s(week_num, bs = "ts", k = 20) + 
+                s(week_of_year, bs = "cc", k = 12) + dow,
+              data = train_df, family = mgcv::nb())
+  }
+}
+
 
 #' Run Operational Model (Recent Horizon)
 #'
@@ -68,43 +92,45 @@ run_operational_model <- function(clean_data) {
   areas <- unique(clean_data$area)
   results_list <- list()
   
+  # --- UPDATED FLAT SYNDROMES LIST ---
+  flat_syndromes <- c("alt_cosc", "conv", "dec_gravi", "int_farm", "rash_cut")
+  
   for (a in areas) {
     area_data <- clean_data |> dplyr::filter(area == a)
     syndromes <- unique(area_data$sindrome)
     
-    # We focus on the last 60 days for the report plot
     report_window_start <- max(area_data$Data_inizio_sett) - lubridate::days(60)
     
     area_preds <- purrr::map_dfr(syndromes, function(s) {
       syn_data <- area_data |> dplyr::filter(sindrome == s)
       
-      # Train on everything BEFORE the report window to simulate "live" prediction
       train_df <- syn_data |> dplyr::filter(Data_inizio_sett < report_window_start)
       test_df  <- syn_data |> dplyr::filter(Data_inizio_sett >= report_window_start)
       
-      # 1. Fit Static GAM
-      m <- mgcv::gam(casi ~ s(week_num, bs = "ts", k = 20) + 
-                       s(week_of_year, bs = "cc", k = 12) + dow,
-                     data = train_df, family = mgcv::nb())
-      
+      # 1. Train Model using the centralized helper function
+      m <- fit_syndrome_gam(train_df, s, flat_syndromes)
       theta <- m$family$getTheta(TRUE)
       
-      # 2. Predict
+      # 2. Predict baseline
       raw_pred <- stats::predict(m, newdata = test_df, type = "response")
       
-      # 3. Calculate Bias (Adaptive Shift) from the end of training data
-      last_14 <- train_df |> utils::tail(14)
-      last_14_pred <- stats::predict(m, newdata = last_14, type = "response")
-      bias <- mean(last_14$casi) / mean(last_14_pred)
-      if(is.na(bias) || is.infinite(bias)) bias <- 1
+      # 3. Apply Adaptive Bias (Frozen for flat syndromes)
+      if (s %in% flat_syndromes) {
+        bias <- 1 
+      } else {
+        last_14 <- train_df |> utils::tail(14)
+        last_14_pred <- stats::predict(m, newdata = last_14, type = "response")
+        bias <- mean(last_14$casi) / mean(last_14_pred)
+        if(is.na(bias) || is.infinite(bias)) bias <- 1
+      }
       
-      # 4. Adaptive Forecast
+      # 4. Final Thresholds
       adaptive_pred <- raw_pred * bias
       
       dplyr::tibble(
         Data_inizio_sett = test_df$Data_inizio_sett,
         sindrome = s,
-        casi = test_df$casi, # Observed
+        casi = test_df$casi, 
         expected = as.numeric(adaptive_pred),
         limit_95 = stats::qnbinom(0.95, mu = as.numeric(adaptive_pred), size = theta),
         limit_99 = stats::qnbinom(0.99, mu = as.numeric(adaptive_pred), size = theta)
@@ -131,6 +157,9 @@ run_rolling_validation <- function(clean_data) {
   areas <- unique(clean_data$area)
   results_list <- list()
   
+  # --- UPDATED FLAT SYNDROMES LIST ---
+  flat_syndromes <- c("alt_cosc", "conv", "dec_gravi", "int_farm", "rash_cut")
+  
   for (a in areas) {
     area_data <- clean_data |> dplyr::filter(area == a)
     syndromes <- unique(area_data$sindrome)
@@ -149,19 +178,23 @@ run_rolling_validation <- function(clean_data) {
         
         # Optimization: Refit model only on 1st of month
         if(lubridate::day(current_date) == 1 || idx == val_indices[1]) {
-          m <- mgcv::gam(casi ~ s(week_num, bs = "ts", k = 20) + 
-                           s(week_of_year, bs = "cc", k = 12) + dow,
-                         data = train_df, family = mgcv::nb())
+          # Train Model using the centralized helper function
+          m <- fit_syndrome_gam(train_df, s, flat_syndromes)
           theta <- m$family$getTheta(TRUE)
         }
         
         test_row <- syn_data[idx, ]
         raw_pred <- stats::predict(m, newdata = test_row, type = "response")
         
-        recent_hist <- train_df |> utils::tail(14)
-        recent_pred <- stats::predict(m, newdata = recent_hist, type = "response")
-        bias <- mean(recent_hist$casi) / mean(recent_pred)
-        if(is.na(bias) || is.infinite(bias)) bias <- 1
+        # Apply Adaptive Bias (Frozen for flat syndromes)
+        if (s %in% flat_syndromes) {
+          bias <- 1 
+        } else {
+          recent_hist <- train_df |> utils::tail(14)
+          recent_pred <- stats::predict(m, newdata = recent_hist, type = "response")
+          bias <- mean(recent_hist$casi) / mean(recent_pred)
+          if(is.na(bias) || is.infinite(bias)) bias <- 1
+        }
         
         preds_list[[as.character(current_date)]] <- dplyr::tibble(
           Date = current_date,

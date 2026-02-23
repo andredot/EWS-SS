@@ -1,7 +1,12 @@
 library(targets)
 library(tarchetypes)
-
 source("R/functions.R")
+
+out_dir <- file.path(getwd(), "output")
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir)
+}
+report_date <- format(Sys.Date(), "%Y_%m_%d")
 
 list(
   # --- 1. GLOBAL DATA ---
@@ -19,56 +24,71 @@ list(
 
   # --- 3. Farrington MODELS (Cached) ---
   tar_target(farrington_results, run_farrington_validation(clean_data)),
+
+    # ... [Keep your data and model targets here] ...
     
-  # ============================================================================
-  #  REPORTS
-  # ============================================================================
-  
-  # --- LOMBARDIA ---
-  tar_render(
-    report_daily_Lombardia, 
-    "report/report.qmd", 
-    params = list(area = "Lombardia"), 
-    output_file = "output/EWS_Report_Lombardia.html"
-  ),
-  tar_render(
-    report_val_Lombardia, "report/validation_report.qmd", 
-    params = list(area = "Lombardia"), output_file = "output/Validation_Report_Lombardia.html"
-  ),
-  tar_render(
-    report_farrington_Lombardia, "report/farrington_validation.qmd", 
-    params = list(area = "Lombardia"), output_file = "output/Farrington_Validation_Lombardia.html"
-  ),
-  
-  # --- MILANO ---
-  tar_render(
-    report_daily_Milano, 
-    "report/report.qmd", 
-    params = list(area = "Milano"), 
-    output_file = "output/EWS_Report_Milano.html"
-  ),
-  tar_render(
-    report_val_Milano, "report/validation_report.qmd", 
-    params = list(area = "Milano"), output_file = "output/Validation_Report_Milano.html"
-  ),
-  tar_render(
-    report_farrington_Milano, "report/farrington_validation.qmd", 
-    params = list(area = "Milano"), output_file = "output/Farrington_Validation_Milano.html"
-  ),
-  
-  # --- VALTELLINA ---
-  tar_render(
-    report_daily_Valtellina, 
-    "report/report.qmd", 
-    params = list(area = "Valtellina"), 
-    output_file = "output/EWS_Report_Valtellina.html"
-  ),
-  tar_render(
-    report_val_Valtellina, "report/validation_report.qmd", 
-    params = list(area = "Valtellina"), output_file = "output/Validation_Report_Valtellina.html"
-  ),
-  tar_render(
-    report_farrington_Valtellina, "report/farrington_validation.qmd", 
-    params = list(area = "Valtellina"), output_file = "output/Farrington_Validation_Valtellina.html"
-  )
+    # ============================================================================
+    #  REPORTS
+    # ============================================================================
+    
+    # --- LOMBARDIA ---
+    tar_render(
+      report_daily_Lombardia, 
+      "report/report.qmd", 
+      params = list(area = "Lombardia"), 
+      # Use file.path() with out_dir to force the absolute path
+      output_file = file.path(out_dir, paste0(report_date, "_EWS_Report_Lombardia.html"))
+    ),
+    tar_render(
+      report_val_Lombardia, 
+      "report/validation_report.qmd", 
+      params = list(area = "Lombardia"), 
+      output_file = file.path(out_dir, paste0(report_date, "_Validation_Report_Lombardia.html"))
+    ),
+    tar_render(
+      report_farrington_Lombardia, 
+      "report/farrington_validation.qmd", 
+      params = list(area = "Lombardia"), 
+      output_file = file.path(out_dir, paste0(report_date, "_Farrington_Validation_Lombardia.html"))
+    ),
+    
+    # --- MILANO ---
+    tar_render(
+      report_daily_Milano, 
+      "report/report.qmd", 
+      params = list(area = "Milano"), 
+      output_file = file.path(out_dir, paste0(report_date, "_EWS_Report_Milano.html"))
+    ),
+    tar_render(
+      report_val_Milano, 
+      "report/validation_report.qmd", 
+      params = list(area = "Milano"), 
+      output_file = file.path(out_dir, paste0(report_date, "_Validation_Report_Milano.html"))
+    ),
+    tar_render(
+      report_farrington_Milano, 
+      "report/farrington_validation.qmd", 
+      params = list(area = "Milano"), 
+      output_file = file.path(out_dir, paste0(report_date, "_Farrington_Validation_Milano.html"))
+    ),
+    
+    # --- VALTELLINA ---
+    tar_render(
+      report_daily_Valtellina, 
+      "report/report.qmd", 
+      params = list(area = "Valtellina"), 
+      output_file = file.path(out_dir, paste0(report_date, "_EWS_Report_Valtellina.html"))
+    ),
+    tar_render(
+      report_val_Valtellina, 
+      "report/validation_report.qmd", 
+      params = list(area = "Valtellina"), 
+      output_file = file.path(out_dir, paste0(report_date, "_Validation_Report_Valtellina.html"))
+    ),
+    tar_render(
+      report_farrington_Valtellina, 
+      "report/farrington_validation.qmd", 
+      params = list(area = "Valtellina"), 
+      output_file = file.path(out_dir, paste0(report_date, "_Farrington_Validation_Valtellina.html"))
+    )
 )
