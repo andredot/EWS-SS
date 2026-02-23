@@ -1,0 +1,117 @@
+---
+title: "Farrington Flexible Validation Protocol"
+subtitle: "Surveillance Package Baseline Validation: `r params$area`"
+author: "Early Warning System"
+params:
+  area: "Lombardia" 
+format:
+  html:
+    theme: flatly
+    toc: true
+    embed-resources: true
+    code-fold: true
+    df-print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=12, fig.height=8)
+library(tidyverse)
+library(kableExtra)
+library(targets)
+```
+
+# Introduction
+
+This document evaluates the `farringtonFlexible` algorithm implemented in the R `surveillance` package (Salmon et al., 2016). Unlike the GAM approach, the Farrington algorithm relies on a restricted reference window (e.g., comparing the current week exclusively to the same week in previous years, $\pm w$ days) to define a Negative Binomial upper bound.
+
+This retrospective validation analyzes the previous 365 days of emergency department aggregates to evaluate the algorithm's empirical alerting behavior.
+
+# Data Loading
+
+We extract the pre-calculated Farrington upper bounds dynamically from the `targets` cache.
+
+```{r load-data}
+# Read the cached Farrington target list
+all_farrington_results <- tar_read(farrington_results)
+val_df <- all_farrington_results[[params$area]]
+
+if(is.null(val_df)) stop(paste("No Farrington data found for:", params$area))
+
+# Calculate coverage rates
+metrics <- val_df |>
+  group_by(sindrome) |>
+  summarise(
+    `Total Weeks` = n(),
+    `Alerts Triggered` = sum(Status == "ALERT (99%)", na.rm = TRUE),
+    `Coverage %` = round(100 - (`Alerts Triggered` / n() * 100), 1)
+  )
+```
+
+# Farrington Coverage Metrics
+
+If the Farrington model is perfectly calibrated, the Empirical Coverage should be close to 99%, generating alerts only for statistically significant anomalies outside the expected historic seasonality.
+
+```{r metrics}
+kable(metrics, caption = "Empirical Coverage of the Farrington 99% Threshold") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) |>
+  column_spec(4, bold = TRUE, color = ifelse(metrics$`Coverage %` < 95, "red", "green"))
+```
+
+# Visual Validation (Time Series)
+
+The plots below visualize the `farringtonFlexible` expected baseline against actual observed counts. The red shaded area indicates the "Alert Zone" where case counts exceed the historical 99th percentile plugin threshold.
+
+
+```{r validation-visual}
+ggplot(val_df, aes(x = Date)) +
+  # Upper bound shade area
+  geom_ribbon(aes(ymin = Limit_99, ymax = max(Observed, na.rm = TRUE) * 1.1, fill = "Alert Zone"), alpha = 0.1) +
+  
+  # Farrington threshold and expectation
+  geom_line(aes(y = Limit_99, color = "99% Upperbound"), linewidth = 0.8, linetype = "dashed") +
+  geom_line(aes(y = Expected, color = "Expected Base"), linewidth = 0.6, alpha = 0.6) +
+  
+  # Observed data
+  geom_line(aes(y = Observed), color = "gray60", linewidth = 0.5) +
+  geom_point(aes(y = Observed, color = ifelse(Status == "ALERT (99%)", "Alert Triggered", "Normal")), size = 1.5) +
+  
+  # Layout
+  facet_wrap(~sindrome, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c("Alert Zone" = "red")) +
+  scale_color_manual(values = c(
+    "99% Upperbound" = "firebrick",
+    "Expected Base" = "steelblue",
+    "Alert Triggered" = "red",
+    "Normal" = "black"
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Farrington Algorithm: Retrospective Alert Validation",
+    subtitle = "Comparing observed counts against Farrington's historical reference window bounds",
+    y = "Cumulative 7-Day Counts", 
+    x = "Date",
+    color = "Legend", fill = ""
+  ) +
+  theme(legend.position = "bottom")
+```
+
+# Alert Log
+
+Below is the chronological log of all critical alerts triggered by the Farrington Flexible upper bounds.
+
+```{r alert-log}
+alerts_history <- val_df |>
+  filter(Status == "ALERT (99%)") |>
+  select(Date, sindrome, Observed, Expected, Limit_99) |>
+  arrange(desc(Date), sindrome)
+
+if(nrow(alerts_history) == 0) {
+  cat("> **No critical anomalies detected by Farrington in the validation period.**")
+} else {
+  kable(alerts_history, digits = 1, caption = "Farrington Retrospective Alert Log") |>
+    kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) |>
+    row_spec(0, bold = TRUE) |>
+    scroll_box(height = "500px")
+}
+```
+
