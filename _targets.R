@@ -27,48 +27,48 @@ list(
   # --- LOMBARDIA ---
   tar_render(
     report_daily_Lombardia, 
-    "report.qmd", 
+    "report/report.qmd", 
     params = list(area = "Lombardia"), 
     output_file = "output/EWS_Report_Lombardia.html"
   ),
   tar_render(
-    report_val_Lombardia, "validation_report.qmd", 
+    report_val_Lombardia, "report/validation_report.qmd", 
     params = list(area = "Lombardia"), output_file = "output/Validation_Report_Lombardia.html"
   ),
   tar_render(
-    report_farrington_Lombardia, "farrington_validation.qmd", 
+    report_farrington_Lombardia, "report/farrington_validation.qmd", 
     params = list(area = "Lombardia"), output_file = "output/Farrington_Validation_Lombardia.html"
   ),
   
   # --- MILANO ---
   tar_render(
     report_daily_Milano, 
-    "report.qmd", 
+    "report/report.qmd", 
     params = list(area = "Milano"), 
     output_file = "output/EWS_Report_Milano.html"
   ),
   tar_render(
-    report_val_Milano, "validation_report.qmd", 
+    report_val_Milano, "report/validation_report.qmd", 
     params = list(area = "Milano"), output_file = "output/Validation_Report_Milano.html"
   ),
   tar_render(
-    report_farrington_Milano, "farrington_validation.qmd", 
+    report_farrington_Milano, "report/farrington_validation.qmd", 
     params = list(area = "Milano"), output_file = "output/Farrington_Validation_Milano.html"
   ),
   
   # --- VALTELLINA ---
   tar_render(
     report_daily_Valtellina, 
-    "report.qmd", 
+    "report/report.qmd", 
     params = list(area = "Valtellina"), 
     output_file = "output/EWS_Report_Valtellina.html"
   ),
   tar_render(
-    report_val_Valtellina, "validation_report.qmd", 
+    report_val_Valtellina, "report/validation_report.qmd", 
     params = list(area = "Valtellina"), output_file = "output/Validation_Report_Valtellina.html"
   ),
   tar_render(
-    report_farrington_Valtellina, "farrington_validation.qmd", 
+    report_farrington_Valtellina, "report/farrington_validation.qmd", 
     params = list(area = "Valtellina"), output_file = "output/Farrington_Validation_Valtellina.html"
   )
 )
