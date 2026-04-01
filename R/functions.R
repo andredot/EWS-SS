@@ -362,6 +362,7 @@ run_rolling_validation <- function(clean_data, validation_days = 365) {
     validation_start <- max(area_data$Data_inizio_sett) - lubridate::days(validation_days)
     
     area_val <- purrr::map_dfr(syndromes, function(s) {
+      cat("Processing:", a, "-", s, "\n")
       syn_data <- area_data |> dplyr::filter(sindrome == s)
       val_indices <- which(syn_data$Data_inizio_sett >= validation_start)
       
