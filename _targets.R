@@ -34,8 +34,31 @@ list(
     run_sensitivity_analysis(val_results, outbreak_durations = c(4, 14, 49), n_trials = 50)
   ),
   tar_target(
+    sens_farrington_lombardia,
+    run_farrington_sensitivity_area(clean_data, "Lombardia", 
+                                    outbreak_durations = c(4, 14, 49), n_trials = 20)
+  ),
+  
+  tar_target(
+    sens_farrington_milano,
+    run_farrington_sensitivity_area(clean_data, "Milano", 
+                                    outbreak_durations = c(4, 14, 49), n_trials = 20)
+  ),
+  
+  tar_target(
+    sens_farrington_valtellina,
+    run_farrington_sensitivity_area(clean_data, "Valtellina", 
+                                    outbreak_durations = c(4, 14, 49), n_trials = 20)
+  ),
+  
+  # Combine into the format expected by reports
+  tar_target(
     sens_results_farrington,
-    run_farrington_sensitivity(clean_data, outbreak_durations = c(4, 14, 49), n_trials = 50)
+    combine_farrington_sensitivity(
+      sens_farrington_lombardia,
+      sens_farrington_milano,
+      sens_farrington_valtellina
+    )
   ),
 
   # Report ------------------------------------------------------------------

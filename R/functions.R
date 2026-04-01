@@ -1,3 +1,4 @@
+
 # Data Preprocessing ------------------------------------------------------
 
 #' Load and Clean Emergency Department Data
@@ -150,6 +151,29 @@ calculate_all_baselines <- function(data_list) {
 get_flat_syndromes <- function() {
   
   c("alt_cosc", "conv", "dec_gravi", "int_farm", "rash_cut")
+}
+
+#' Create Univariate STS Object for Single Syndrome
+#'
+#' Helper that creates sts inside the worker to avoid S4 serialization issues.
+#'
+#' @param syn_data Dataframe for a single syndrome
+#' @return A surveillance::sts object
+#' @keywords internal
+create_univariate_sts <- function(syn_data) {
+  library(surveillance)
+  
+  syn_data <- syn_data |> dplyr::arrange(Data_inizio_sett)
+  
+  obs_matrix <- as.matrix(as.integer(syn_data$casi))
+  dimnames(obs_matrix) <- NULL
+  
+  surveillance::sts(
+    observed = obs_matrix,
+    epoch = as.numeric(syn_data$Data_inizio_sett),
+    epochAsDate = TRUE,
+    frequency = 365
+  )
 }
 
 
@@ -340,29 +364,34 @@ run_operational_model <- function(clean_data, report_window_days = 60) {
   return(results_list)
 }
 
-
-#' Run Retrospective Rolling Validation (GAM)
-#'
-#' Performs 365-day sliding window validation.
+#' Run Retrospective Rolling Validation (GAM) - PARALLEL
 #'
 #' @param clean_data The dataframe from load_and_process_data
 #' @param validation_days Number of days for validation period (default: 365)
+#' @param workers Number of parallel workers (default: 14)
 #' @return A list of dataframes, named by area
 #' @export
-run_rolling_validation <- function(clean_data, validation_days = 365) {
+run_rolling_validation <- function(clean_data, validation_days = 365, workers = 14) {
   library(mgcv)
+  library(furrr)
+  
+  future::plan(future::multisession, workers = workers)
+  on.exit(future::plan(future::sequential), add = TRUE)
   
   areas <- unique(clean_data$area)
   flat_syndromes <- get_flat_syndromes()
   results_list <- list()
   
   for (a in areas) {
+    cat("Processing area:", a, "\n")
+    
     area_data <- clean_data |> dplyr::filter(area == a)
     syndromes <- unique(area_data$sindrome)
     validation_start <- max(area_data$Data_inizio_sett) - lubridate::days(validation_days)
     
-    area_val <- purrr::map_dfr(syndromes, function(s) {
-      cat("Processing:", a, "-", s, "\n")
+    # PARALLEL: Process syndromes in parallel
+    area_val <- furrr::future_map_dfr(syndromes, function(s) {
+      # All processing happens inside the worker - no S4 objects passed
       syn_data <- area_data |> dplyr::filter(sindrome == s)
       val_indices <- which(syn_data$Data_inizio_sett >= validation_start)
       
@@ -378,7 +407,7 @@ run_rolling_validation <- function(clean_data, validation_days = 365) {
         
         if (nrow(train_df) < 30) next
         
-        # Refit model monthly for efficiency
+        # Refit model monthly
         if (lubridate::day(current_date) == 1 || idx == val_indices[1]) {
           m <- fit_syndrome_gam(train_df, s, flat_syndromes)
           theta <- m$family$getTheta(TRUE)
@@ -398,11 +427,13 @@ run_rolling_validation <- function(clean_data, validation_days = 365) {
         )
       }
       dplyr::bind_rows(preds_list)
-    })
+    }, .options = furrr::furrr_options(seed = TRUE))
+    
     results_list[[a]] <- area_val
   }
   return(results_list)
 }
+
 
 #' Get Farrington Control Parameters
 #'
@@ -433,25 +464,29 @@ get_farrington_control <- function(range, alpha = 0.01) {
   )
 }
 
-
-#' Run Farrington Flexible Validation (Multivariate)
-#'
-#' Runs the Noufaily-adjusted Farrington algorithm using proper multivariate sts.
+#' Run Farrington Flexible Validation - PARALLEL (FIXED)
 #'
 #' @param clean_data The dataframe from load_and_process_data
 #' @param validation_days Number of days for validation period
+#' @param workers Number of parallel workers (default: 14)
 #' @return A list of dataframes, named by area
 #' @export
-run_farrington_validation <- function(clean_data, validation_days = 365) {
+run_farrington_validation <- function(clean_data, validation_days = 365, workers = 14) {
   library(surveillance)
+  library(furrr)
+  
+  future::plan(future::multisession, workers = workers)
+  on.exit(future::plan(future::sequential), add = TRUE)
   
   areas <- unique(clean_data$area)
   results_list <- list()
   
   for (a in areas) {
-    area_data <- clean_data |> dplyr::filter(area == a)
+    cat("Farrington - Processing area:", a, "\n")
     
-    # Get dates and validation range
+    area_data <- clean_data |> dplyr::filter(area == a)
+    syndromes <- unique(area_data$sindrome)
+    
     dates <- area_data |> 
       dplyr::distinct(Data_inizio_sett) |> 
       dplyr::arrange(Data_inizio_sett) |> 
@@ -465,32 +500,34 @@ run_farrington_validation <- function(clean_data, validation_days = 365) {
       next
     }
     
-    # Create multivariate sts object
-    sts_obj <- tryCatch(
-      create_sts_object(area_data),
-      error = function(e) {
-        warning("Failed to create sts for ", a, ": ", e$message)
-        return(NULL)
-      }
-    )
-    
-    if (is.null(sts_obj)) {
-      results_list[[a]] <- dplyr::tibble()
-      next
-    }
-    
-    syndromes <- colnames(sts_obj@observed)
-    
-    # Run Farrington for each syndrome (surveillance package processes one at a time internally)
-    area_val <- purrr::map_dfr(seq_along(syndromes), function(j) {
-      s <- syndromes[j]
+    # PARALLEL: Each worker creates its own sts object
+    area_val <- furrr::future_map_dfr(syndromes, function(s) {
+      cat("  -", s, "\n")
       
-      # Extract univariate sts for this syndrome
-      sts_uni <- sts_obj[, j]
+      # Filter data for this syndrome
+      syn_data <- area_data |> 
+        dplyr::filter(sindrome == s, !is.na(Data_inizio_sett), !is.na(casi)) |>
+        dplyr::arrange(Data_inizio_sett)
+      
+      if (nrow(syn_data) == 0) return(NULL)
+      
+      # Create sts INSIDE the worker
+      sts_uni <- tryCatch(
+        create_univariate_sts(syn_data),
+        error = function(e) NULL
+      )
+      
+      if (is.null(sts_uni)) return(NULL)
+      
+      # Recalculate val_indices for this syndrome's data
+      syn_dates <- syn_data$Data_inizio_sett
+      syn_val_indices <- which(syn_dates > validation_start)
+      
+      if (length(syn_val_indices) == 0) return(NULL)
       
       # Run at both thresholds
-      control_95 <- get_farrington_control(val_indices, alpha = 0.05)
-      control_99 <- get_farrington_control(val_indices, alpha = 0.01)
+      control_95 <- get_farrington_control(syn_val_indices, alpha = 0.05)
+      control_99 <- get_farrington_control(syn_val_indices, alpha = 0.01)
       
       res_95 <- tryCatch(
         surveillance::farringtonFlexible(sts_uni, control = control_95),
@@ -507,18 +544,18 @@ run_farrington_validation <- function(clean_data, validation_days = 365) {
       # Extract results
       ub_95 <- as.numeric(surveillance::upperbound(res_95))
       ub_99 <- as.numeric(surveillance::upperbound(res_99))
-      observed <- as.numeric(sts_obj@observed[val_indices, j])
+      observed <- syn_data$casi[syn_val_indices]
       
       # Get expected if available
       exp_raw <- res_99@control$expected
-      exp_vec <- if (!is.null(exp_raw) && length(exp_raw) == length(val_indices)) {
+      exp_vec <- if (!is.null(exp_raw) && length(exp_raw) == length(syn_val_indices)) {
         as.numeric(exp_raw)
       } else {
-        rep(NA_real_, length(val_indices))
+        rep(NA_real_, length(syn_val_indices))
       }
       
       dplyr::tibble(
-        Date = dates[val_indices],
+        Date = syn_dates[syn_val_indices],
         sindrome = s,
         Observed = observed,
         Expected = exp_vec,
@@ -531,7 +568,7 @@ run_farrington_validation <- function(clean_data, validation_days = 365) {
           TRUE ~ "GREEN"
         )
       )
-    })
+    }, .options = furrr::furrr_options(seed = TRUE))
     
     results_list[[a]] <- area_val
   }
@@ -539,65 +576,64 @@ run_farrington_validation <- function(clean_data, validation_days = 365) {
 }
 
 
-#' Run GLR for Negative Binomial Validation (Multivariate)
-#'
-#' Implements the Generalized Likelihood Ratio test using multivariate sts.
+#' Run GLR for Negative Binomial Validation - PARALLEL (FIXED)
 #'
 #' @param clean_data The dataframe from load_and_process_data
 #' @param validation_days Number of days for validation period
+#' @param workers Number of parallel workers (default: 14)
 #' @return A list of dataframes, named by area
 #' @export
-run_glrnb_validation <- function(clean_data, validation_days = 365) {
+run_glrnb_validation <- function(clean_data, validation_days = 365, workers = 14) {
   library(surveillance)
+  library(furrr)
+  
+  future::plan(future::multisession, workers = workers)
+  on.exit(future::plan(future::sequential), add = TRUE)
   
   areas <- unique(clean_data$area)
   results_list <- list()
   
   for (a in areas) {
+    cat("GLRNB - Processing area:", a, "\n")
+    
     area_data <- clean_data |> dplyr::filter(area == a)
+    syndromes <- unique(area_data$sindrome)
     
-    dates <- area_data |> 
-      dplyr::distinct(Data_inizio_sett) |> 
-      dplyr::arrange(Data_inizio_sett) |> 
-      dplyr::pull(Data_inizio_sett)
+    validation_start <- max(area_data$Data_inizio_sett) - lubridate::days(validation_days)
     
-    validation_start <- max(dates) - lubridate::days(validation_days)
-    val_indices <- get_validation_indices(dates, validation_start)
-    
-    if (length(val_indices) == 0) {
-      results_list[[a]] <- dplyr::tibble()
-      next
-    }
-    
-    # Create multivariate sts object
-    sts_obj <- tryCatch(
-      create_sts_object(area_data),
-      error = function(e) NULL
-    )
-    
-    if (is.null(sts_obj)) {
-      results_list[[a]] <- dplyr::tibble()
-      next
-    }
-    
-    syndromes <- colnames(sts_obj@observed)
-    train_indices <- seq_len(min(val_indices) - 1)
-    
-    area_val <- purrr::map_dfr(seq_along(syndromes), function(j) {
-      s <- syndromes[j]
-      sts_uni <- sts_obj[, j]
+    # PARALLEL: Each worker creates its own sts object
+    area_val <- furrr::future_map_dfr(syndromes, function(s) {
+      cat("  -", s, "\n")
       
-      # Estimate in-control parameters from training period
-      train_obs <- as.numeric(sts_obj@observed[train_indices, j])
-      if (length(train_obs) < 30) return(NULL)
+      syn_data <- area_data |> 
+        dplyr::filter(sindrome == s, !is.na(Data_inizio_sett), !is.na(casi)) |>
+        dplyr::arrange(Data_inizio_sett)
       
+      if (nrow(syn_data) < 50) return(NULL)
+      
+      syn_dates <- syn_data$Data_inizio_sett
+      syn_val_indices <- which(syn_dates > validation_start)
+      train_indices <- which(syn_dates <= validation_start)
+      
+      if (length(syn_val_indices) == 0 || length(train_indices) < 30) return(NULL)
+      
+      # Create sts INSIDE the worker
+      sts_uni <- tryCatch(
+        create_univariate_sts(syn_data),
+        error = function(e) NULL
+      )
+      
+      if (is.null(sts_uni)) return(NULL)
+      
+      # Estimate in-control parameters
+      train_obs <- syn_data$casi[train_indices]
       mu0 <- mean(train_obs, na.rm = TRUE)
       var_train <- var(train_obs, na.rm = TRUE)
       alpha0 <- if (var_train <= mu0) 100 else mu0^2 / (var_train - mu0)
       
       control <- list(
-        range = val_indices,
-        mu0 = rep(mu0, length(val_indices)),
+        range = syn_val_indices,
+        mu0 = rep(mu0, length(syn_val_indices)),
         alpha = alpha0,
         c.ARL = 5,
         ret = "cases",
@@ -613,10 +649,10 @@ run_glrnb_validation <- function(clean_data, validation_days = 365) {
       
       alarms <- as.numeric(surveillance::alarms(res))
       upperbound <- as.numeric(surveillance::upperbound(res))
-      observed <- as.numeric(sts_obj@observed[val_indices, j])
+      observed <- syn_data$casi[syn_val_indices]
       
       dplyr::tibble(
-        Date = dates[val_indices],
+        Date = syn_dates[syn_val_indices],
         sindrome = s,
         Observed = observed,
         Expected = mu0,
@@ -624,12 +660,14 @@ run_glrnb_validation <- function(clean_data, validation_days = 365) {
         Alarm = alarms,
         Status = dplyr::if_else(alarms == 1, "ALERT", "GREEN")
       )
-    })
+    }, .options = furrr::furrr_options(seed = TRUE))
     
     results_list[[a]] <- area_val
   }
   return(results_list)
 }
+
+
 
 
 #' Run Poisson Baseline Model
@@ -686,89 +724,101 @@ run_poisson_baseline <- function(clean_data, validation_days = 365) {
 
 # Validation and Testing --------------------------------------------------
 
-#' Run Sensitivity Analysis with Variable Outbreak Durations
-#'
-#' Injects synthetic outbreaks to calculate Probability of Detection (POD).
-#' Supports multiple outbreak durations for comprehensive evaluation.
+#' Run Sensitivity Analysis - PARALLEL (FIXED)
 #'
 #' @param validation_results_list Output from run_rolling_validation (GAM)
 #' @param outbreak_durations Vector of outbreak durations to test (in days)
 #' @param n_trials Number of Monte Carlo trials per magnitude level
+#' @param workers Number of parallel workers (default: 14)
 #' @return A list of dataframes with POD curves, named by area
 #' @export
 run_sensitivity_analysis <- function(validation_results_list, 
                                      outbreak_durations = c(4, 14, 49),
-                                     n_trials = 50) {
+                                     n_trials = 50,
+                                     workers = 14) {
+  library(furrr)
+  
+  future::plan(future::multisession, workers = workers)
+  on.exit(future::plan(future::sequential), add = TRUE)
   
   areas <- names(validation_results_list)
   final_results <- list()
   
   for (a in areas) {
+    cat("Sensitivity GAM - Processing area:", a, "\n")
+    
     val_df <- validation_results_list[[a]]
     if (is.null(val_df) || nrow(val_df) == 0) next
     
     syndromes <- unique(val_df$sindrome)
     
-    area_pod <- purrr::map_dfr(outbreak_durations, function(duration) {
-      purrr::map_dfr(syndromes, function(s) {
-        
-        s_data <- val_df |> 
-          dplyr::filter(sindrome == s) |>
-          dplyr::mutate(
-            Baseline_99 = stats::qnbinom(0.99, mu = Adaptive_Pred, size = Theta),
-            Is_Green = Observed <= Baseline_99
-          ) |>
-          dplyr::arrange(Date)
-        
-        if (nrow(s_data) < duration + 20) return(NULL)
-        
-        valid_dates <- unique(s_data$Date)
-        valid_dates <- valid_dates[valid_dates < (max(valid_dates) - (duration - 1))]
-        
-        # Find clean windows
-        clean_start_dates_idx <- purrr::map_lgl(valid_dates, function(d) {
-          window_slice <- s_data |> dplyr::filter(Date >= d, Date <= d + (duration - 1))
-          nrow(window_slice) == duration && all(window_slice$Is_Green)
-        })
-        
-        green_pool <- valid_dates[clean_start_dates_idx]
-        sampling_pool <- if (length(green_pool) < 20) valid_dates else green_pool
-        
-        if (length(sampling_pool) == 0) return(NULL)
-        
-        magnitudes <- 0:13
-        
-        purrr::map_dfr(magnitudes, function(m) {
-          total_fake <- 2^m
-          detected <- 0
-          
-          for (t in 1:n_trials) {
-            start_date <- sample(sampling_pool, 1)
-            window <- seq(start_date, start_date + (duration - 1), by = "day")
-            
-            fake_cases <- generate_outbreak_shape(total_fake, duration, cumulative = TRUE)
-            
-            slice <- s_data |> dplyr::filter(Date %in% window) |> dplyr::arrange(Date)
-            if (nrow(slice) < duration) next
-            
-            injected_obs <- slice$Observed + fake_cases
-            new_bias <- mean(injected_obs) / mean(slice$Raw_Pred)
-            if (is.na(new_bias) || is.infinite(new_bias)) new_bias <- 1
-            
-            new_thresh_99 <- stats::qnbinom(0.99, mu = slice$Raw_Pred * new_bias, size = slice$Theta)
-            
-            if (sum(injected_obs > new_thresh_99) > 0) detected <- detected + 1
-          }
-          
-          dplyr::tibble(
-            Total_Cases = total_fake,
-            POD = detected / n_trials,
-            sindrome = s,
-            Duration_Days = duration
-          )
-        })
+    # Create combinations
+    combinations <- expand.grid(
+      sindrome = syndromes, 
+      duration = outbreak_durations, 
+      stringsAsFactors = FALSE
+    )
+    
+    # PARALLEL
+    area_pod <- furrr::future_pmap_dfr(combinations, function(sindrome, duration) {
+      s <- sindrome
+      
+      s_data <- val_df |> 
+        dplyr::filter(sindrome == s) |>
+        dplyr::mutate(
+          Baseline_99 = stats::qnbinom(0.99, mu = Adaptive_Pred, size = Theta),
+          Is_Green = Observed <= Baseline_99
+        ) |>
+        dplyr::arrange(Date)
+      
+      if (nrow(s_data) < duration + 20) return(NULL)
+      
+      valid_dates <- unique(s_data$Date)
+      valid_dates <- valid_dates[valid_dates < (max(valid_dates) - (duration - 1))]
+      
+      # Find clean windows
+      clean_start_dates_idx <- purrr::map_lgl(valid_dates, function(d) {
+        window_slice <- s_data |> dplyr::filter(Date >= d, Date <= d + (duration - 1))
+        nrow(window_slice) == duration && all(window_slice$Is_Green)
       })
-    })
+      
+      green_pool <- valid_dates[clean_start_dates_idx]
+      sampling_pool <- if (length(green_pool) < 20) valid_dates else green_pool
+      
+      if (length(sampling_pool) == 0) return(NULL)
+      
+      magnitudes <- 0:13
+      
+      purrr::map_dfr(magnitudes, function(m) {
+        total_fake <- 2^m
+        detected <- 0
+        
+        for (t in 1:n_trials) {
+          start_date <- sample(sampling_pool, 1)
+          window <- seq(start_date, start_date + (duration - 1), by = "day")
+          
+          fake_cases <- generate_outbreak_shape(total_fake, duration, cumulative = TRUE)
+          
+          slice <- s_data |> dplyr::filter(Date %in% window) |> dplyr::arrange(Date)
+          if (nrow(slice) < duration) next
+          
+          injected_obs <- slice$Observed + fake_cases
+          new_bias <- mean(injected_obs) / mean(slice$Raw_Pred)
+          if (is.na(new_bias) || is.infinite(new_bias)) new_bias <- 1
+          
+          new_thresh_99 <- stats::qnbinom(0.99, mu = slice$Raw_Pred * new_bias, size = slice$Theta)
+          
+          if (sum(injected_obs > new_thresh_99) > 0) detected <- detected + 1
+        }
+        
+        dplyr::tibble(
+          Total_Cases = total_fake,
+          POD = detected / n_trials,
+          sindrome = s,
+          Duration_Days = duration
+        )
+      })
+    }, .options = furrr::furrr_options(seed = TRUE))
     
     final_results[[a]] <- area_pod
   }
@@ -776,142 +826,206 @@ run_sensitivity_analysis <- function(validation_results_list,
 }
 
 
-#' Run Sensitivity Analysis for Farrington Model
+#' Run Sensitivity Analysis for Farrington - SINGLE AREA, PARALLEL
 #'
-#' Performs synthetic outbreak injection for the Farrington Flexible model.
+#' Processes one area at a time with parallel workers.
 #'
 #' @param clean_data The dataframe from load_and_process_data
+#' @param area_name Which area to process ("Lombardia", "Milano", "Valtellina")
 #' @param outbreak_durations Vector of outbreak durations to test
 #' @param n_trials Number of Monte Carlo trials per magnitude level
-#' @return A list of dataframes with POD curves, named by area
+#' @param workers Number of parallel workers (default: 14)
+#' @return A dataframe with POD curves for the specified area
 #' @export
-run_farrington_sensitivity <- function(clean_data, 
-                                       outbreak_durations = c(4, 14, 49),
-                                       n_trials = 50) {
+run_farrington_sensitivity_area <- function(clean_data, 
+                                            area_name,
+                                            outbreak_durations = c(4, 14, 49),
+                                            n_trials = 20,
+                                            workers = 14) {
   library(surveillance)
+  library(furrr)
   
-  areas <- unique(clean_data$area)
-  final_results <- list()
+  # Set up parallel backend
+  future::plan(future::multisession, workers = workers)
+  on.exit(future::plan(future::sequential), add = TRUE)
   
-  for (a in areas) {
-    area_data <- clean_data |> dplyr::filter(area == a)
-    syndromes <- unique(area_data$sindrome)
-    validation_start <- max(area_data$Data_inizio_sett) - lubridate::days(365)
+  cat("\n========================================\n")
+  cat("Sensitivity Farrington - Area:", area_name, "(parallel)\n")
+  cat("========================================\n")
+  
+  area_data <- clean_data |> dplyr::filter(area == area_name)
+  
+  if (nrow(area_data) == 0) {
+    warning("No data found for area: ", area_name)
+    return(dplyr::tibble())
+  }
+  
+  syndromes <- unique(area_data$sindrome)
+  validation_start <- max(area_data$Data_inizio_sett, na.rm = TRUE) - lubridate::days(365)
+  
+  # Create combinations
+  combinations <- expand.grid(
+    sindrome = syndromes, 
+    duration = outbreak_durations,
+    stringsAsFactors = FALSE
+  )
+  
+  n_total <- nrow(combinations)
+  cat("Total combinations:", n_total, "\n")
+  cat("Workers:", workers, "\n\n")
+  
+  # PARALLEL processing
+  area_pod <- furrr::future_pmap_dfr(combinations, function(sindrome, duration) {
     
-    area_pod <- purrr::map_dfr(outbreak_durations, function(duration) {
-      purrr::map_dfr(syndromes, function(s) {
-        
-        syn_data <- area_data |> 
-          dplyr::filter(sindrome == s) |> 
-          dplyr::arrange(Data_inizio_sett)
-        
-        if (nrow(syn_data) < 100) return(NULL)
-        
-        val_indices <- which(syn_data$Data_inizio_sett > validation_start)
-        if (length(val_indices) < duration) return(NULL)
-        
-        # Create baseline sts and run once to find green periods
-        obs_matrix <- as.matrix(as.integer(syn_data$casi))
-        dimnames(obs_matrix) <- NULL
-        
-        sts_obj <- tryCatch(
-          surveillance::sts(
-            observed = obs_matrix,
-            epoch = as.numeric(syn_data$Data_inizio_sett),
-            epochAsDate = TRUE,
-            frequency = 365
-          ),
-          error = function(e) NULL
-        )
-        
-        if (is.null(sts_obj)) return(NULL)
-        
-        control_99 <- get_farrington_control(val_indices, alpha = 0.01)
-        
-        res_base <- tryCatch(
-          surveillance::farringtonFlexible(sts_obj, control = control_99),
-          error = function(e) NULL
-        )
-        
-        if (is.null(res_base)) return(NULL)
-        
-        ub_99 <- as.numeric(surveillance::upperbound(res_base))
-        is_green <- syn_data$casi[val_indices] <= ub_99
-        
-        valid_dates <- syn_data$Data_inizio_sett[val_indices]
-        valid_dates <- valid_dates[valid_dates < (max(valid_dates) - (duration - 1))]
-        
-        clean_idx <- purrr::map_lgl(seq_along(valid_dates), function(i) {
-          if (i + duration - 1 > length(is_green)) return(FALSE)
-          all(is_green[i:(i + duration - 1)])
-        })
-        
-        sampling_pool <- if (sum(clean_idx) >= 10) valid_dates[clean_idx] else valid_dates
-        
-        if (length(sampling_pool) == 0) return(NULL)
-        
-        magnitudes <- 0:13
-        
-        purrr::map_dfr(magnitudes, function(m) {
-          total_fake <- 2^m
-          detected <- 0
-          
-          for (t in 1:n_trials) {
-            start_date <- sample(sampling_pool, 1)
-            start_idx <- which(syn_data$Data_inizio_sett == start_date)
-            
-            if (length(start_idx) == 0 || start_idx + duration - 1 > nrow(syn_data)) next
-            
-            end_idx <- start_idx + duration - 1
-            
-            fake_cases <- generate_outbreak_shape(total_fake, duration, cumulative = TRUE)
-            modified_cases <- syn_data$casi
-            modified_cases[start_idx:end_idx] <- modified_cases[start_idx:end_idx] + fake_cases
-            
-            mod_matrix <- as.matrix(as.integer(modified_cases))
-            dimnames(mod_matrix) <- NULL
-            
-            sts_mod <- tryCatch(
-              surveillance::sts(
-                observed = mod_matrix,
-                epoch = as.numeric(syn_data$Data_inizio_sett),
-                epochAsDate = TRUE,
-                frequency = 365
-              ),
-              error = function(e) NULL
-            )
-            
-            if (is.null(sts_mod)) next
-            
-            outbreak_range <- start_idx:end_idx
-            control_mod <- get_farrington_control(outbreak_range, alpha = 0.01)
-            
-            res_mod <- tryCatch(
-              surveillance::farringtonFlexible(sts_mod, control = control_mod),
-              error = function(e) NULL
-            )
-            
-            if (is.null(res_mod)) next
-            
-            alarms_mod <- as.numeric(surveillance::alarms(res_mod))
-            if (sum(alarms_mod) > 0) detected <- detected + 1
-          }
-          
-          dplyr::tibble(
-            Total_Cases = total_fake,
-            POD = detected / n_trials,
-            sindrome = s,
-            Duration_Days = duration
-          )
-        })
-      })
+    s <- sindrome
+    
+    syn_data <- area_data |> 
+      dplyr::filter(sindrome == s) |> 
+      dplyr::arrange(Data_inizio_sett)
+    
+    if (nrow(syn_data) < 100) return(NULL)
+    
+    val_indices <- which(syn_data$Data_inizio_sett > validation_start)
+    if (length(val_indices) < duration) return(NULL)
+    
+    # Create sts
+    sts_obj <- tryCatch(
+      create_univariate_sts(syn_data),
+      error = function(e) NULL
+    )
+    
+    if (is.null(sts_obj)) return(NULL)
+    
+    control_99 <- get_farrington_control(val_indices, alpha = 0.01)
+    
+    res_base <- tryCatch(
+      surveillance::farringtonFlexible(sts_obj, control = control_99),
+      error = function(e) NULL
+    )
+    
+    if (is.null(res_base)) return(NULL)
+    
+    ub_99 <- as.numeric(surveillance::upperbound(res_base))
+    
+    # Handle potential NA in upperbound
+    if (all(is.na(ub_99))) return(NULL)
+    
+    # Safe comparison handling NA
+    is_green <- !is.na(ub_99) & !is.na(syn_data$casi[val_indices]) & 
+      syn_data$casi[val_indices] <= ub_99
+    
+    valid_dates <- syn_data$Data_inizio_sett[val_indices]
+    valid_dates <- valid_dates[valid_dates < (max(valid_dates, na.rm = TRUE) - (duration - 1))]
+    
+    if (length(valid_dates) == 0) return(NULL)
+    
+    # Find clean windows with NA handling
+    clean_idx <- purrr::map_lgl(seq_along(valid_dates), function(idx) {
+      if (idx + duration - 1 > length(is_green)) return(FALSE)
+      window <- is_green[idx:(idx + duration - 1)]
+      if (any(is.na(window))) return(FALSE)
+      all(window)
     })
     
-    final_results[[a]] <- area_pod
+    # Ensure no NA in clean_idx
+    clean_idx[is.na(clean_idx)] <- FALSE
+    
+    # Build sampling pool
+    n_clean <- sum(clean_idx)
+    if (n_clean >= 10) {
+      sampling_pool <- valid_dates[clean_idx]
+    } else {
+      sampling_pool <- valid_dates
+    }
+    
+    if (length(sampling_pool) == 0) return(NULL)
+    
+    magnitudes <- c(0, 2, 4, 6, 8, 10, 12)
+    
+    purrr::map_dfr(magnitudes, function(m) {
+      total_fake <- 2^m
+      detected <- 0
+      valid_trials <- 0
+      
+      for (t in 1:n_trials) {
+        start_date <- sample(sampling_pool, 1)
+        start_idx <- which(syn_data$Data_inizio_sett == start_date)
+        
+        if (length(start_idx) == 0 || start_idx + duration - 1 > nrow(syn_data)) next
+        
+        end_idx <- start_idx + duration - 1
+        
+        fake_cases <- generate_outbreak_shape(total_fake, duration, cumulative = TRUE)
+        modified_cases <- syn_data$casi
+        modified_cases[start_idx:end_idx] <- modified_cases[start_idx:end_idx] + fake_cases
+        
+        # Create modified sts
+        mod_syn_data <- syn_data
+        mod_syn_data$casi <- modified_cases
+        
+        sts_mod <- tryCatch(
+          create_univariate_sts(mod_syn_data),
+          error = function(e) NULL
+        )
+        
+        if (is.null(sts_mod)) next
+        
+        outbreak_range <- start_idx:end_idx
+        control_mod <- get_farrington_control(outbreak_range, alpha = 0.01)
+        
+        res_mod <- tryCatch(
+          surveillance::farringtonFlexible(sts_mod, control = control_mod),
+          error = function(e) NULL
+        )
+        
+        if (is.null(res_mod)) next
+        
+        valid_trials <- valid_trials + 1
+        alarms_mod <- as.numeric(surveillance::alarms(res_mod))
+        if (sum(alarms_mod, na.rm = TRUE) > 0) detected <- detected + 1
+      }
+      
+      pod_value <- if (valid_trials > 0) detected / valid_trials else NA_real_
+      
+      dplyr::tibble(
+        Total_Cases = total_fake,
+        POD = pod_value,
+        Valid_Trials = valid_trials,
+        sindrome = s,
+        Duration_Days = duration
+      )
+    })
+  }, .options = furrr::furrr_options(seed = TRUE))
+  
+  cat("Area", area_name, "complete!\n")
+  
+  # Add area column
+  if (nrow(area_pod) > 0) {
+    area_pod$area <- area_name
   }
-  return(final_results)
+  
+  return(area_pod)
 }
 
+
+#' Combine Farrington Sensitivity Results
+#'
+#' Helper to combine results from separate area runs into the expected list format.
+#'
+#' @param lombardia_results Output from run_farrington_sensitivity_area for Lombardia
+#' @param milano_results Output from run_farrington_sensitivity_area for Milano
+#' @param valtellina_results Output from run_farrington_sensitivity_area for Valtellina
+#' @return A list of dataframes, named by area (matching original format)
+#' @export
+combine_farrington_sensitivity <- function(lombardia_results, 
+                                           milano_results, 
+                                           valtellina_results) {
+  list(
+    Lombardia = lombardia_results,
+    Milano = milano_results,
+    Valtellina = valtellina_results
+  )
+}
 #' Calculate Residual Diagnostics for Any Model
 #'
 #' Computes overdispersion index and autocorrelation of residuals.
