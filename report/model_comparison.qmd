@@ -1,0 +1,748 @@
+---
+title: "Model Comparison for Syndromic Surveillance"
+subtitle: "Systematic Evaluation of Detection Algorithms: `r params$area`"
+author: "Andrea Pedot"
+date: "`r Sys.Date()`"
+params:
+  area: "Lombardia" # Options: Lombardia, Milano, Valtellina
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    df-print: paged
+    fig-width: 12
+    fig-height: 8
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| include: false
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(mgcv)
+library(surveillance)
+library(kableExtra)
+library(lubridate)
+library(targets)
+library(patchwork)
+```
+
+# Introduction
+
+## Syndromic Surveillance Overview
+
+Syndromic surveillance is a public health strategy that monitors pre-diagnostic health indicators to detect disease outbreaks earlier than traditional laboratory-confirmed reporting. Rather than waiting for confirmed diagnoses, syndromic surveillance systems analyze patterns in Emergency Department (ED) visits, categorized by presenting symptoms or chief complaints.
+This approach enables:
+
+- **Early detection**: Identifying unusual health patterns before laboratory confirmation
+- **Situational awareness**: Real-time monitoring of population health trends
+- **Resource planning**: Anticipating healthcare system demands
+
+## Study Context
+
+This analysis evaluates syndromic surveillance data from **`r params$area`**, covering ED visits from December 2022 through March 2026. The data encompasses nine syndrome categories representing distinct epidemiological patterns:
+
+**High-volume, seasonal syndromes** (modeled with flexible approaches):
+
+- `tot`: Total ED visits (baseline denominator)
+- `resp`: Respiratory conditions
+- `polm`: Pulmonary conditions
+- `ili`: Influenza-like illness
+- `gastro`: Gastrointestinal conditions
+
+**Low-volume, sporadic syndromes** (requiring robust, conservative thresholds):
+  
+- `alt_cosc`: Altered consciousness
+- `conv`: Convulsions
+- `dec_gravi`: Unexpected deaths
+- `int_farm`: Drug intoxications
+- `rash_cut`: Cutaneous rashes
+
+## Objective
+
+This report systematically compares four statistical approaches for anomaly detection in syndromic surveillance, evaluating their performance across multiple dimensions including accuracy, calibration, sensitivity to outbreak detection, and operational characteristics.
+
+```{r load-data}
+# Load all required data from targets
+clean_data <- tar_read(clean_data)
+all_data_list <- tar_read(all_data_list)
+all_stats_list <- tar_read(all_stats_list)
+all_baselines_list <- tar_read(all_baselines_list)
+
+# Model results
+val_results <- tar_read(val_results)
+farrington_results <- tar_read(farrington_results)
+glrnb_results <- tar_read(glrnb_results)
+poisson_results <- tar_read(poisson_results)
+
+# Sensitivity results (now unified with multiple durations)
+sens_results_gam <- tar_read(sens_results_gam)
+sens_results_farrington <- tar_read(sens_results_farrington)
+
+# Filter for current area
+df_long <- all_data_list[[params$area]]
+
+cat("Analysis Area:", params$area, "\n")
+cat("Date Range:", as.character(min(df_long$Data_inizio_sett)), "to", 
+    as.character(max(df_long$Data_inizio_sett)), "\n")
+cat("Total Observations:", nrow(df_long))
+```
+
+
+# Methods
+
+## Data Infrastructure
+
+### Temporal Structure
+
+The input data consists of rolling 7-day windows with daily overlap. Each row represents a week-long aggregation of ED visits, advancing by one day. This structure provides smooth temporal resolution while maintaining sufficient statistical power for rare syndromes.
+
+```{r data-structure}
+# Show data structure
+df_long |>
+  group_by(sindrome) |>
+  summarise(
+    First_Date = min(Data_inizio_sett),
+    Last_Date = max(Data_inizio_sett),
+    N_Observations = n(),
+    Mean_Cases = round(mean(casi, na.rm = TRUE), 1),
+    SD_Cases = round(sd(casi, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) |>
+  kable(caption = "Data Summary by Syndrome") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### Train-Test Split Strategy
+
+To prevent data leakage and ensure valid out-of-sample evaluation, the data is partitioned as follows:
+
+- **Training Period**: December 2022 – March 2025 (~27 months)
+- **Testing Period**: March 2025 – March 2026 (12 months)
+
+All model parameters, including seasonal patterns and adaptive calibration factors, are estimated exclusively from training data. The testing period serves as a held-out validation set for performance comparison.
+
+```{r split-definition}
+validation_start <- max(df_long$Data_inizio_sett) - days(365)
+
+train_df <- df_long |> filter(Data_inizio_sett <= validation_start)
+test_df <- df_long |> filter(Data_inizio_sett > validation_start)
+
+cat("Training observations:", nrow(train_df), "\n")
+cat("Testing observations:", nrow(test_df), "\n")
+cat("Validation start date:", as.character(validation_start))
+```
+
+
+## Exploratory Data Analysis
+
+### Long-Term Trends
+
+Visualizing the temporal evolution of each syndrome reveals underlying patterns that detection algorithms must account for.
+
+```{r eda-longterm}
+ggplot(df_long, aes(x = Data_inizio_sett, y = casi, color = sindrome)) +
+  geom_line(alpha = 0.6) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = FALSE, linewidth = 1) +
+  facet_wrap(~sindrome, scales = "free_y", ncol = 3) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "6 months") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    title = "Long-Term Syndrome Trends",
+    subtitle = "Smoothed GAM trend overlaid on raw weekly counts",
+    x = "Date", y = "Weekly Cases"
+  )
+```
+
+### Seasonal Patterns
+
+Annual seasonality is a critical feature for respiratory and influenza-like syndromes, with predictable winter peaks.
+
+```{r eda-seasonal}
+df_long |>
+  mutate(month = month(Data_inizio_sett, label = TRUE)) |>
+  group_by(sindrome, month) |>
+  summarise(mean_cases = mean(casi, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(x = month, y = mean_cases, group = sindrome, color = sindrome)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~sindrome, scales = "free_y", ncol = 3) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(
+    title = "Average Seasonal Patterns by Month",
+    x = "Month", y = "Mean Weekly Cases"
+  )
+```
+
+### Overdispersion Analysis
+
+Overdispersion occurs when variance exceeds the mean, violating Poisson assumptions. The overdispersion index (variance/mean) quantifies this deviation.
+
+```{r eda-overdispersion}
+stats_current <- all_stats_list[[params$area]]
+overdisp_stats <- stats_current$overdispersion
+
+overdisp_stats |>
+  mutate(
+    Overdispersed = ifelse(overdisp_index > 1, "Yes", "No")
+  ) |>
+  kable(digits = 2, caption = "Overdispersion Diagnostics by Syndrome") |>
+  kable_styling(bootstrap_options = c("striped", "hover")) |>
+  column_spec(5, bold = TRUE, 
+              color = ifelse(overdisp_stats$overdisp_index > 1, "red", "green"))
+```
+
+### Autocorrelation Structure
+
+Temporal autocorrelation indicates the degree to which consecutive observations are correlated, which affects both model specification and threshold calibration.
+
+```{r eda-acf}
+acf_data <- stats_current$acf
+
+ggplot(acf_data, aes(x = lags, y = acf_vals, fill = sindrome)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = c(-0.2, 0.2), linetype = "dashed", color = "red", alpha = 0.5) +
+  facet_wrap(~sindrome, ncol = 3, scales = "free_y") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(
+    title = "Autocorrelation Function (ACF) of Weekly Changes",
+    subtitle = "Dashed lines indicate approximate 95% significance bounds",
+    x = "Lag (weeks)", y = "ACF"
+  )
+```
+
+
+## Model Specifications
+
+### Model 1: Adaptive GAM with Negative Binomial Distribution
+
+A Generalized Additive Model using thin-plate regression splines for trend and cyclic splines for seasonality, with a 14-day adaptive bias correction.
+
+**Flexible specification** (seasonal syndromes):
+$$\log(\mu_t) = \beta_0 + f_1(\text{week\_num}) + f_2(\text{week\_of\_year}) + \gamma \cdot \text{dow}$$
+
+**Stiff specification** (sporadic syndromes):
+$$\log(\mu_t) = \beta_0 + f_1(\text{week\_num}) + \gamma \cdot \text{dow}$$
+
+where $f_1$ uses thin-plate splines with $k=20$ or $k=3$ knots, and $f_2$ uses cyclic cubic splines with $k=12$.
+
+The 14-day adaptive calibration applies a multiplicative bias factor:
+$$\text{bias} = \frac{\bar{y}_{t-14:t}}{\bar{\hat{y}}_{t-14:t}}$$
+
+### Model 2: Farrington Flexible Algorithm
+
+The Noufaily-adjusted Farrington algorithm, implemented in the `surveillance` R package, uses quasi-Poisson regression with historical reference windows.
+
+Key parameters:
+
+- Reference window: $b = 2$ years, $w = 21$ days (3 weeks)
+- Reweighting for past outbreaks: `weightsThreshold = 2.58`
+- Trend inclusion: `trend = TRUE`
+- Power transformation: $y^{2/3}$
+
+### Model 3: GLR for Negative Binomial (CUSUM-based)
+
+The Generalized Likelihood Ratio statistic for detecting shifts in the mean of a Negative Binomial distribution, using a CUSUM-type accumulation.
+
+$$\Lambda_t = \max\left(0, \Lambda_{t-1} + \log\frac{f(y_t; \mu_1, \alpha)}{f(y_t; \mu_0, \alpha)}\right)$$
+
+An alarm is triggered when $\Lambda_t > h$ (threshold controlling ARL).
+
+### Model 4: Poisson Baseline (Benchmark)
+
+A naive benchmark using the historical training mean as the expected value:
+$$\hat{\mu} = \frac{1}{n_{\text{train}}} \sum_{t \in \text{train}} y_t$$
+
+Thresholds are set using Poisson quantiles. This model serves as a lower-bound benchmark.
+
+
+# Results
+
+## Model Training and Residual Diagnostics
+
+### GAM Residual Analysis
+
+```{r gam-standardize}
+# Standardize GAM results
+gam_std <- standardize_gam_results(val_results, params$area)
+```
+
+#### Q-Q Plot (GAM)
+
+```{r gam-qq}
+gam_std |>
+  group_by(sindrome) |>
+  mutate(
+    observed = sort(Std_Residual),
+    theoretical = qnorm(ppoints(n()))
+  ) |>
+  ungroup() |>
+  ggplot(aes(x = theoretical, y = observed)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "firebrick") +
+  facet_wrap(~sindrome, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(
+    title = "Q-Q Plot: GAM Standardized Residuals",
+    subtitle = "Deviation from diagonal indicates departure from normality",
+    x = "Theoretical Quantiles", y = "Sample Quantiles"
+  )
+```
+
+#### Calibration Plot (GAM)
+
+```{r gam-calibration}
+ggplot(gam_std, aes(x = Expected, y = Observed)) +
+  geom_point(alpha = 0.2, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  geom_smooth(method = "gam", color = "firebrick", se = FALSE) +
+  facet_wrap(~sindrome, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(
+    title = "Calibration: GAM Observed vs. Expected",
+    subtitle = "Perfect calibration follows the diagonal; red line shows actual trend",
+    x = "Expected Cases", y = "Observed Cases"
+  )
+```
+
+#### Residual Autocorrelation (GAM)
+
+```{r gam-residual-acf}
+gam_diag <- calculate_residual_diagnostics(gam_std, "Residual")
+
+ggplot(gam_diag$acf, aes(x = lags, y = acf_vals)) +
+  geom_col(fill = "steelblue", width = 0.7) +
+  geom_hline(yintercept = c(-0.2, 0.2), linetype = "dashed", color = "red", alpha = 0.5) +
+  facet_wrap(~sindrome, ncol = 3) +
+  theme_minimal() +
+  labs(
+    title = "Residual Autocorrelation: GAM Model",
+    subtitle = "Residual ACF should be near zero if model captures temporal structure",
+    x = "Lag", y = "ACF"
+  )
+```
+
+### Farrington Residual Analysis
+
+```{r farrington-standardize}
+farr_std <- standardize_farrington_results(farrington_results, params$area)
+```
+
+```{r farrington-plots}
+#| layout-ncol: 1
+
+if (nrow(farr_std) > 0 && sum(!is.na(farr_std$Expected)) > 10) {
+  
+  # Q-Q Plot
+  p1 <- farr_std |>
+    filter(!is.na(Std_Residual)) |>
+    group_by(sindrome) |>
+    mutate(
+      observed = sort(Std_Residual),
+      theoretical = qnorm(ppoints(n()))
+    ) |>
+    ungroup() |>
+    ggplot(aes(x = theoretical, y = observed)) +
+    geom_point(alpha = 0.3, color = "darkorange") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "firebrick") +
+    facet_wrap(~sindrome, scales = "free", ncol = 3) +
+    theme_minimal() +
+    labs(title = "Q-Q Plot: Farrington Standardized Residuals",
+         x = "Theoretical Quantiles", y = "Sample Quantiles")
+  
+  print(p1)
+  
+  # Calibration Plot
+  p2 <- farr_std |>
+    filter(!is.na(Expected)) |>
+    ggplot(aes(x = Expected, y = Observed)) +
+    geom_point(alpha = 0.2, color = "darkorange") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+    geom_smooth(method = "gam", color = "firebrick", se = FALSE) +
+    facet_wrap(~sindrome, scales = "free", ncol = 3) +
+    theme_minimal() +
+    labs(title = "Calibration: Farrington Observed vs. Expected",
+         x = "Expected Cases", y = "Observed Cases")
+  
+  print(p2)
+  
+} else {
+  cat("Insufficient Farrington results for diagnostic plots.")
+}
+```
+
+### Poisson Baseline Residual Analysis
+
+```{r poisson-plots}
+poisson_df <- poisson_results[[params$area]]
+
+if (!is.null(poisson_df) && nrow(poisson_df) > 0) {
+  
+  # Q-Q Plot
+  poisson_df |>
+    group_by(sindrome) |>
+    mutate(
+      observed = sort(Residual),
+      theoretical = qnorm(ppoints(n()))
+    ) |>
+    ungroup() |>
+    ggplot(aes(x = theoretical, y = observed)) +
+    geom_point(alpha = 0.3, color = "forestgreen") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "firebrick") +
+    facet_wrap(~sindrome, scales = "free", ncol = 3) +
+    theme_minimal() +
+    labs(
+      title = "Q-Q Plot: Poisson Baseline Residuals",
+      x = "Theoretical Quantiles", y = "Sample Quantiles"
+    )
+}
+```
+
+
+## Performance Metrics Comparison
+
+```{r metrics-calculation}
+# Calculate metrics for each model
+metrics_gam <- calculate_model_metrics(gam_std, "GAM Adaptive")
+
+metrics_farr <- if (nrow(farr_std) > 0) {
+  calculate_model_metrics(farr_std, "Farrington")
+} else {
+  tibble()
+}
+
+metrics_poisson <- if (!is.null(poisson_df) && nrow(poisson_df) > 0) {
+  calculate_model_metrics(poisson_df, "Poisson Baseline")
+} else {
+  tibble()
+}
+
+# GLR-NB metrics (simplified - uses alarm-based evaluation)
+glrnb_df <- glrnb_results[[params$area]]
+metrics_glrnb <- if (!is.null(glrnb_df) && nrow(glrnb_df) > 0) {
+  glrnb_df |>
+    group_by(sindrome) |>
+    summarise(
+      Model = "GLR-NB",
+      N_Obs = n(),
+      RMSE = sqrt(mean((Observed - Expected)^2, na.rm = TRUE)),
+      MAE = mean(abs(Observed - Expected), na.rm = TRUE),
+      MAPE = mean(abs(Observed - Expected) / (Observed + 1), na.rm = TRUE) * 100,
+      Mean_Bias = mean(Observed - Expected, na.rm = TRUE),
+      R2 = NA_real_,
+      Coverage_95 = NA_real_,
+      Coverage_99 = NA_real_,
+      Alert_Rate_95 = NA_real_,
+      Alert_Rate_99 = mean(Alarm == 1, na.rm = TRUE) * 100,
+      .groups = "drop"
+    )
+} else {
+  tibble()
+}
+
+# Combine all metrics
+all_metrics <- bind_rows(metrics_gam, metrics_farr, metrics_poisson, metrics_glrnb) |>
+  filter(!is.na(RMSE))
+```
+
+### Summary Statistics
+
+```{r metrics-summary}
+all_metrics |>
+  group_by(Model) |>
+  summarise(
+    Avg_RMSE = mean(RMSE, na.rm = TRUE),
+    Avg_MAE = mean(MAE, na.rm = TRUE),
+    Avg_R2 = mean(R2, na.rm = TRUE),
+    Avg_Coverage_95 = mean(Coverage_95, na.rm = TRUE),
+    Avg_Alert_Rate_99 = mean(Alert_Rate_99, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  kable(digits = 2, caption = "Model Performance Summary (Averaged Across Syndromes)") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### Detailed Metrics by Syndrome
+
+```{r metrics-detailed}
+all_metrics |>
+  select(sindrome, Model, RMSE, MAE, R2, Coverage_95, Alert_Rate_99) |>
+  pivot_wider(
+    names_from = Model,
+    values_from = c(RMSE, MAE, R2, Coverage_95, Alert_Rate_99),
+    names_glue = "{Model}_{.value}"
+  ) |>
+  kable(digits = 2, caption = "Detailed Performance Metrics by Syndrome") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 10) |>
+  scroll_box(width = "100%")
+```
+
+### RMSE Comparison Visualization
+
+```{r metrics-plot}
+all_metrics |>
+  ggplot(aes(x = reorder(sindrome, RMSE), y = RMSE, fill = Model)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal() +
+  labs(
+    title = "RMSE Comparison Across Models",
+    x = "Syndrome", y = "Root Mean Square Error"
+  )
+```
+
+
+## Historical Alert Reconstruction
+
+### GAM Alerts
+
+```{r gam-alerts}
+gam_alerts <- gam_std |>
+  filter(Status == "RED") |>
+  select(Date, Syndrome = sindrome, Observed, Expected, Status) |>
+  mutate(Model = "GAM Adaptive") |>
+  arrange(Syndrome, desc(Date))
+
+if (nrow(gam_alerts) > 0) {
+  gam_alerts |>
+    head(100) |>
+    kable(digits = 1, caption = "GAM Adaptive: Critical Alerts (99% Threshold)") |>
+    kable_styling(bootstrap_options = c("striped", "condensed", "hover")) |>
+    scroll_box(height = "400px")
+} else {
+  cat("No critical alerts detected by GAM model.")
+}
+```
+
+### Farrington Alerts
+
+```{r farrington-alerts}
+farr_alerts <- farr_std |>
+  filter(grepl("RED", Status)) |>
+  select(Date, Syndrome = sindrome, Observed, Expected, Status) |>
+  mutate(Model = "Farrington") |>
+  arrange(Syndrome, desc(Date))
+
+if (nrow(farr_alerts) > 0) {
+  farr_alerts |>
+    head(100) |>
+    kable(digits = 1, caption = "Farrington: Critical Alerts (99% Threshold)") |>
+    kable_styling(bootstrap_options = c("striped", "condensed", "hover")) |>
+    scroll_box(height = "400px")
+} else {
+  cat("No critical alerts detected by Farrington model.")
+}
+```
+
+### GLR-NB Alerts
+
+```{r glrnb-alerts}
+if (!is.null(glrnb_df) && nrow(glrnb_df) > 0) {
+  glrnb_alerts <- glrnb_df |>
+    filter(Alarm == 1) |>
+    select(Date, Syndrome = sindrome, Observed, Expected, Status) |>
+    mutate(Model = "GLR-NB") |>
+    arrange(Syndrome, desc(Date))
+  
+  if (nrow(glrnb_alerts) > 0) {
+    glrnb_alerts |>
+      head(100) |>
+      kable(digits = 1, caption = "GLR-NB: Detected Alarms") |>
+      kable_styling(bootstrap_options = c("striped", "condensed", "hover")) |>
+      scroll_box(height = "400px")
+  } else {
+    cat("No alarms detected by GLR-NB model.")
+  }
+}
+```
+
+### Alert Concordance
+
+```{r alert-concordance}
+# Combine all alerts
+all_alerts <- bind_rows(
+  gam_alerts |> select(Date, Syndrome, Model),
+  farr_alerts |> select(Date, Syndrome, Model),
+  if (exists("glrnb_alerts") && nrow(glrnb_alerts) > 0) {
+    glrnb_alerts |> select(Date, Syndrome, Model)
+  } else {
+    tibble()
+  }
+)
+
+if (nrow(all_alerts) > 0) {
+  # Count alerts by date and syndrome
+  concordance <- all_alerts |>
+    group_by(Date, Syndrome) |>
+    summarise(
+      Models_Alerting = paste(sort(unique(Model)), collapse = ", "),
+      N_Models = n_distinct(Model),
+      .groups = "drop"
+    ) |>
+    filter(N_Models >= 2) |>
+    arrange(desc(N_Models), desc(Date))
+  
+  if (nrow(concordance) > 0) {
+    concordance |>
+      head(50) |>
+      kable(caption = "Alert Concordance: Dates with Multiple Models Alerting") |>
+      kable_styling(bootstrap_options = c("striped", "hover"))
+  } else {
+    cat("No dates where multiple models simultaneously triggered alerts.")
+  }
+}
+```
+
+
+## Sensitivity Analysis: Probability of Detection
+
+### GAM Model - Multi-Duration POD
+
+```{r sens-gam}
+sens_gam_df <- sens_results_gam[[params$area]]
+
+if (!is.null(sens_gam_df) && nrow(sens_gam_df) > 0) {
+  ggplot(sens_gam_df, aes(x = Total_Cases, y = POD, color = factor(Duration_Days))) +
+    geom_hline(yintercept = 0.8, linetype = "dotted", color = "gray40") +
+    geom_line(linewidth = 1) +
+    geom_point(size = 1.5, alpha = 0.7) +
+    scale_x_log10(labels = scales::comma) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, 1.05)) +
+    scale_color_brewer(palette = "Dark2", name = "Outbreak\nDuration (days)") +
+    facet_wrap(~sindrome, ncol = 3) +
+    theme_minimal() +
+    labs(
+      title = "GAM Adaptive: Sensitivity Analysis",
+      subtitle = "Probability of Detection vs. Outbreak Magnitude (4, 14, 49-day durations)",
+      x = "Total Outbreak Cases (log scale)", y = "Probability of Detection"
+    )
+} else {
+  cat("GAM sensitivity results not available.")
+}
+```
+
+### Farrington Model - Multi-Duration POD
+
+```{r sens-farrington}
+sens_farr_df <- sens_results_farrington[[params$area]]
+
+if (!is.null(sens_farr_df) && nrow(sens_farr_df) > 0) {
+  ggplot(sens_farr_df, aes(x = Total_Cases, y = POD, color = factor(Duration_Days))) +
+    geom_hline(yintercept = 0.8, linetype = "dotted", color = "gray40") +
+    geom_line(linewidth = 1) +
+    geom_point(size = 1.5, alpha = 0.7) +
+    scale_x_log10(labels = scales::comma) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, 1.05)) +
+    scale_color_brewer(palette = "Dark2", name = "Outbreak\nDuration (days)") +
+    facet_wrap(~sindrome, ncol = 3) +
+    theme_minimal() +
+    labs(
+      title = "Farrington Flexible: Sensitivity Analysis",
+      subtitle = "Probability of Detection vs. Outbreak Magnitude (4, 14, 49-day durations)",
+      x = "Total Outbreak Cases (log scale)", y = "Probability of Detection"
+    )
+} else {
+  cat("Farrington sensitivity results not available.")
+}
+```
+
+### Comparative POD at 80% Detection Threshold
+
+```{r sens-comparison}
+# Calculate the minimum outbreak size for 80% detection
+get_pod80_threshold <- function(df, model_name) {
+  if (is.null(df) || nrow(df) == 0) return(tibble())
+  
+  df |>
+    group_by(sindrome, Duration_Days) |>
+    arrange(Total_Cases) |>
+    filter(POD >= 0.8) |>
+    slice_head(n = 1) |>
+    ungroup() |>
+    mutate(Model = model_name) |>
+    select(sindrome, Duration_Days, Threshold_80_POD = Total_Cases, Model)
+}
+
+pod80_gam <- get_pod80_threshold(sens_gam_df, "GAM Adaptive")
+pod80_farr <- get_pod80_threshold(sens_farr_df, "Farrington")
+
+pod80_combined <- bind_rows(pod80_gam, pod80_farr)
+
+if (nrow(pod80_combined) > 0) {
+  pod80_combined |>
+    pivot_wider(names_from = Model, values_from = Threshold_80_POD) |>
+    kable(caption = "Minimum Outbreak Size for 80% Detection Probability") |>
+    kable_styling(bootstrap_options = c("striped", "hover"))
+}
+```
+
+
+# Conclusion
+
+## Data Leakage Prevention
+
+This analysis implements strict temporal separation to prevent information leakage:
+
+1. **Training/Validation Split**: All model parameters are estimated using data up to March 2025. The subsequent 12 months serve exclusively as the test set.
+
+2. **Rolling-Origin Cross-Validation**: For validation metrics, models are re-trained at each time point using only past data, simulating real-world deployment conditions.
+
+3. **Adaptive Calibration Isolation**: The 14-day bias correction uses only observations prior to each prediction point, never incorporating future information.
+
+## Uncertainty Quantification
+
+Uncertainty is addressed through multiple mechanisms:
+
+- **Negative Binomial Distribution**: Explicitly models overdispersion, providing wider prediction intervals than Poisson
+- **Monte Carlo Simulation**: Sensitivity analysis uses n=50 random trials per magnitude level to account for temporal variability
+- **Dual Thresholds**: 95% (Yellow) and 99% (Red) confidence levels provide graduated alert severity
+
+## Generalizability Considerations
+
+**Strengths**:
+
+- Models are area-specific, capturing local patterns
+- Syndrome-specific model selection (flexible vs. stiff) adapts to epidemiological characteristics
+- Three geographic areas (Lombardia, Milano, Valtellina) provide internal replication
+
+**Limitations**:
+
+- Results may not generalize to regions with different healthcare infrastructure or population demographics
+- Rare syndromes have limited statistical power for POD estimation
+- The rolling-window data structure introduces autocorrelation that may inflate apparent performance
+
+## General Limitations
+
+1. **No Ground Truth**: Without confirmed outbreak labels, we cannot directly measure true positive/false positive rates
+
+2. **Computational Constraints**: Sensitivity analysis is limited to 50 trials per condition; larger simulations would provide narrower confidence intervals
+
+3. **Single Data Source**: ED visits capture only a subset of disease burden; community-based illnesses may be underrepresented
+
+4. **Temporal Extrapolation**: Future outbreaks may differ in shape from the sigmoidal injection model used in sensitivity analysis
+
+## Summary Recommendations
+
+Based on the comparative evaluation:
+
+- **GAM Adaptive** provides the best balance of accuracy and calibration for seasonal syndromes
+- **Farrington Flexible** offers regulatory-standard methodology with established validation history
+- **GLR-NB** is most sensitive to sudden shifts but may require tuning for local conditions
+- **Poisson Baseline** confirms that sophisticated methods provide meaningful improvement over naive approaches
+
+For operational deployment, a multi-model ensemble approach may provide the most robust surveillance, with concordance across methods increasing confidence in true alerts.
+
+---
+
+*Report generated: `r Sys.time()`*
