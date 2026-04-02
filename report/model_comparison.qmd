@@ -12,6 +12,7 @@ output:
     toc-depth: 3
     code_folding: hide
     df-print: paged
+    embed-resources: true
 execute:
   warning: false
   message: false
@@ -294,10 +295,10 @@ if (!is.null(poisson_df) && nrow(poisson_df) > 0) {
 A Generalized Additive Model (GAM) that decomposes ED visit counts into interpretable components using flexible spline functions. The model uses the Negative Binomial distribution to handle overdispersion.
 
 **Flexible specification** (for syndromes with strong seasonality):
-$$\log(\mu_t) = \beta_0 + f_1(\text{week\_num}_t; k=20) + f_2(\text{week\_of\_year}_t; k=12) + \boldsymbol{\gamma}^\top \text{dow}_t$$
+$$\log(\mu_t) = \beta_0 + f_1(\text{week_num}_t; k=20) + f_2(\text{week_of_year}_t; k=12) + \boldsymbol{\gamma}^\top \text{dow}_t$$
 
 **Stiff specification** (for sporadic syndromes without clear seasonal patterns):
-$$\log(\mu_t) = \beta_0 + f_1(\text{week\_num}_t; k=3) + \boldsymbol{\gamma}^\top \text{dow}_t$$
+$$\log(\mu_t) = \beta_0 + f_1(\text{week_num}_t; k=3) + \boldsymbol{\gamma}^\top \text{dow}_t$$
 
 Where:
 
@@ -354,13 +355,15 @@ The Farrington Flexible algorithm (Noufaily et al., 2012) is the ECDC-recommende
 
 **Key parameters (deviations from defaults)**:
 
-- `b = 2`: Uses 2 years of historical data as reference (default is 3)
+- `b = 2`: Uses 2 years of historical data as reference (default is 3); can be increased when more data becomes available
 - `w = 21`: Reference window of 21 days (3 weeks) around the current time point
 - `noPeriods = 10`: Number of periods for seasonal adjustment
 - `pastWeeksNotIncluded = 182`: Excludes the most recent 26 weeks (182 days) from reference to avoid contamination by ongoing outbreaks
 - `reweight = TRUE, weightsThreshold = 2.58`: Downweights historical observations exceeding 2.58 standard deviations (past outbreaks)
+- `pThresholdTrend = 0.05`: p-value threshold for including trend term; ECDC recommends 0.05 (Noufaily et al. suggest 1 to always include trend)
+- `limit54 = c(5, 4)`: Minimum counts required for model fitting (5 non-zero observations in at least 4 years)
 - `powertrans = "2/3"`: Power transformation $y^{2/3}$ to stabilize variance
-- `thresholdMethod = "nbPlugin"`: Uses negative binomial plug-in for threshold calculation
+- `thresholdMethod = "nbPlugin"`: Uses negative binomial plug-in for threshold calculation, accounting for overdispersion
 
 The algorithm produces time-varying thresholds that adapt to seasonal patterns and trend.
 
@@ -412,14 +415,23 @@ $$\Lambda_t = \max\left(0, \Lambda_{t-1} + \log\frac{f(y_t; \mu_1, \alpha)}{f(y_
 Where:
 
 - $f(y; \mu, \alpha)$ is the Negative Binomial probability mass function
-- $\mu_0$ is the in-control mean (estimated from training data)
+- $\mu_0$ is the in-control mean (estimated automatically from past data)
 - $\mu_1 = e^\theta \cdot \mu_0$ is the out-of-control mean we want to detect
-- $\alpha$ is the dispersion parameter (estimated via method of moments)
-- $\theta = \log(1.5)$ means we're tuned to detect a 50% increase in the mean
+- $\alpha$ is the dispersion parameter (estimated automatically from data)
+- $\theta = \log(1.2)$ means we're tuned to detect a 20% increase in the mean (ECDC default)
 
-An alarm triggers when $\Lambda_t > h$, where $h$ is chosen to control the Average Run Length (ARL) — the expected time until false alarm under in-control conditions. We use `c.ARL = 5` as the threshold.
+An alarm triggers when $\Lambda_t > h$, where $h$ is chosen to control the Average Run Length (ARL). We use `c.ARL = 0.25` as the threshold (ECDC default).
 
-**ARL (Average Run Length)**: The expected number of observations until an alarm is raised. Under in-control conditions, higher ARL means fewer false alarms; under out-of-control conditions, lower ARL means faster detection.
+**Key parameters**:
+
+- `mu0 = NULL, alpha = NULL`: In-control mean and dispersion estimated automatically from the data
+- `theta = log(1.2)`: Calibrated to detect a 20% increase in the mean
+- `c.ARL = 0.25`: Low threshold for sensitive detection (ECDC recommendation)
+- `M = 121`: Uses the past 121 observations (~4 months) for baseline estimation
+- `Mtilde = 1`: Window for parameter estimation
+- `change = "intercept"`: Detects shifts in the intercept (level changes)
+
+**ARL (Average Run Length)**: The expected number of observations until an alarm is raised. Under in-control conditions, higher ARL means fewer false alarms; under out-of-control conditions, lower ARL means faster detection. The low `c.ARL = 0.25` prioritizes sensitivity over specificity, which may result in sustained alarm periods during elevated activity.
 
 ```{r glrnb-burst-plot}
 #| fig-width: 14
@@ -1140,6 +1152,7 @@ Based on the comparative evaluation:
 - **Poisson Baseline** confirms that at least some of the sophisticated methods evaluated here provide meaningful improvement over naive approaches.
 
 For operational deployment, we recommend thorough parallel testing of multiple methods before full implementation across all ASSTs. Concordance across models increases confidence in true alerts, while discordance may indicate borderline signals requiring epidemiological review. Prospective validation over at least one complete seasonal cycle is advisable before relying on any single method for public health action.
+
 ---
 
 *Report generated: `r Sys.time()`*

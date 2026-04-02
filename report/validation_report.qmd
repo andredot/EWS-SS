@@ -11,6 +11,7 @@ output:
     toc_depth: 2
     code_folding: hide
     df_print: paged
+    embed-resources: true
 ---
 
 ```{r setup, include=FALSE}
