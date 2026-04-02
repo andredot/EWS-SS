@@ -409,15 +409,15 @@ get_farrington_control <- function(range, alpha = 0.01) {
   list(
     range = range,
     noPeriods = 10,
-    b = 2,
+    b = 2,     # increase when more data will be available
     w = 21,
     reweight = TRUE,
     weightsThreshold = 2.58,
     glmWarnings = FALSE,
+    pThresholdTrend = 0.05,       # ECDC reccomends 0.05 (Noufailly says 1)
     alpha = alpha,
     trend = TRUE,
     pastWeeksNotIncluded = 182,
-    pThresholdTrend = 1,
     limit54 = c(5, 4),
     powertrans = "2/3",
     fitFun = "algo.farrington.fitGLM.flexible",
@@ -538,7 +538,7 @@ run_farrington_validation <- function(clean_data, validation_days = 365, workers
 }
 
 
-#' Run GLR for Negative Binomial Validation - PARALLEL (FIXED)
+#' Run GLR for Negative Binomial Validation - PARALLEL (ECDC Parameters)
 #'
 #' @param clean_data The dataframe from load_and_process_data
 #' @param validation_days Number of days for validation period
@@ -587,19 +587,24 @@ run_glrnb_validation <- function(clean_data, validation_days = 365, workers = 14
       
       if (is.null(sts_uni)) return(NULL)
       
-      # Estimate in-control parameters
+      # Estimate in-control parameters from training data
       train_obs <- syn_data$casi[train_indices]
-      mu0 <- mean(train_obs, na.rm = TRUE)
+      mu0_est <- mean(train_obs, na.rm = TRUE)
       var_train <- var(train_obs, na.rm = TRUE)
-      alpha0 <- if (var_train <= mu0) 100 else mu0^2 / (var_train - mu0)
+      # Estimate alpha (dispersion) via method of moments
+      alpha0_est <- if (var_train <= mu0_est) 100 else mu0_est^2 / (var_train - mu0_est)
       
+      # ECDC recommended parameters (Table 4)
       control <- list(
         range = syn_val_indices,
-        mu0 = rep(mu0, length(syn_val_indices)),
-        alpha = alpha0,
-        c.ARL = 5,
-        ret = "cases",
-        theta = log(1.5)
+        mu0 = NULL,              # NULL = estimate from data
+        alpha = NULL,            # NULL = estimate from data  
+        theta = log(1.2),        # Detection of 20% increase (ECDC default)
+        c.ARL = 0.25,            # ECDC default threshold
+        Mtilde = 1,              # ECDC default
+        M = 121,                  # ECDC default is to use all past data
+        change = "intercept",    # ECDC default
+        ret = "cases"
       )
       
       res <- tryCatch(
@@ -613,11 +618,18 @@ run_glrnb_validation <- function(clean_data, validation_days = 365, workers = 14
       upperbound <- as.numeric(surveillance::upperbound(res))
       observed <- syn_data$casi[syn_val_indices]
       
+      # Get the estimated mu0 for reporting
+      expected_mu <- if (!is.null(res@control$mu0)) {
+        mean(res@control$mu0, na.rm = TRUE)
+      } else {
+        mu0_est
+      }
+      
       dplyr::tibble(
         Date = syn_dates[syn_val_indices],
         sindrome = s,
         Observed = observed,
-        Expected = mu0,
+        Expected = expected_mu,
         Upperbound = upperbound,
         Alarm = alarms,
         Status = dplyr::if_else(alarms == 1, "ALERT", "GREEN")
@@ -628,9 +640,6 @@ run_glrnb_validation <- function(clean_data, validation_days = 365, workers = 14
   }
   return(results_list)
 }
-
-
-
 
 #' Run Poisson Baseline Model
 #'
@@ -686,15 +695,15 @@ run_poisson_baseline <- function(clean_data, validation_days = 365) {
 
 # Validation and Testing --------------------------------------------------
 
-#' Run Sensitivity Analysis - PARALLEL (FIXED)
+#' Run Sensitivity Analysis for GAM Model
 #'
-#' @param validation_results_list Output from run_rolling_validation (GAM)
-#' @param outbreak_durations Vector of outbreak durations to test (in days)
+#' @param validation_results_list Output from run_rolling_validation
+#' @param outbreak_durations Vector of outbreak durations to test
 #' @param n_trials Number of Monte Carlo trials per magnitude level
-#' @param workers Number of parallel workers (default: 14)
-#' @return A list of dataframes with POD curves, named by area
+#' @param workers Number of parallel workers
+#' @return A list of POD dataframes, named by area
 #' @export
-run_sensitivity_analysis <- function(validation_results_list, 
+run_sensitivity_analysis <- function(validation_results_list,
                                      outbreak_durations = c(4, 14, 49),
                                      n_trials = 50,
                                      workers = 14) {
@@ -704,90 +713,102 @@ run_sensitivity_analysis <- function(validation_results_list,
   on.exit(future::plan(future::sequential), add = TRUE)
   
   areas <- names(validation_results_list)
-  final_results <- list()
+  results_list <- list()
   
   for (a in areas) {
-    cat("Sensitivity GAM - Processing area:", a, "\n")
+    cat("\nSensitivity Analysis - Area:", a, "\n")
     
     val_df <- validation_results_list[[a]]
     if (is.null(val_df) || nrow(val_df) == 0) next
     
     syndromes <- unique(val_df$sindrome)
     
-    # Create combinations
+    # Create all combinations of syndrome x duration
     combinations <- expand.grid(
-      sindrome = syndromes, 
-      duration = outbreak_durations, 
+      sindrome = syndromes,
+      duration = outbreak_durations,
       stringsAsFactors = FALSE
     )
     
-    # PARALLEL
     area_pod <- furrr::future_pmap_dfr(combinations, function(sindrome, duration) {
-      s <- sindrome
       
-      s_data <- val_df |> 
-        dplyr::filter(sindrome == s) |>
-        dplyr::mutate(
-          Baseline_99 = stats::qnbinom(0.99, mu = Adaptive_Pred, size = Theta),
-          Is_Green = Observed <= Baseline_99
-        ) |>
+      syn_data <- val_df |>
+        dplyr::filter(sindrome == !!sindrome) |>
         dplyr::arrange(Date)
       
-      if (nrow(s_data) < duration + 20) return(NULL)
+      if (nrow(syn_data) < duration + 10) return(NULL)
       
-      valid_dates <- unique(s_data$Date)
-      valid_dates <- valid_dates[valid_dates < (max(valid_dates) - (duration - 1))]
+      # Identify baseline status (GREEN = within 95% threshold)
+      syn_data <- syn_data |>
+        dplyr::mutate(
+          is_green = Observed <= qnbinom(0.95, mu = Adaptive_Pred, size = Theta)
+        )
       
-      # Find clean windows
-      clean_start_dates_idx <- purrr::map_lgl(valid_dates, function(d) {
-        window_slice <- s_data |> dplyr::filter(Date >= d, Date <= d + (duration - 1))
-        nrow(window_slice) == duration && all(window_slice$Is_Green)
-      })
+      # Find windows of `duration` consecutive GREEN days
+      # These are "clean" periods where false alarm rate is 0 by definition
+      valid_starts <- c()
       
-      green_pool <- valid_dates[clean_start_dates_idx]
-      sampling_pool <- if (length(green_pool) < 20) valid_dates else green_pool
+      for (i in 1:(nrow(syn_data) - duration + 1)) {
+        window <- syn_data$is_green[i:(i + duration - 1)]
+        if (all(window, na.rm = TRUE) && !any(is.na(window))) {
+          valid_starts <- c(valid_starts, i)
+        }
+      }
       
-      if (length(sampling_pool) == 0) return(NULL)
+      if (length(valid_starts) < 5) {
+        # Not enough clean windows for reliable estimation
+        return(NULL)
+      }
       
-      magnitudes <- 0:13
+      # Magnitudes to test (powers of 2)
+      magnitudes <- c(0, 2, 4, 6, 8, 10, 12)
       
       purrr::map_dfr(magnitudes, function(m) {
         total_fake <- 2^m
         detected <- 0
+        valid_trials <- 0
         
-        for (t in 1:n_trials) {
-          start_date <- sample(sampling_pool, 1)
-          window <- seq(start_date, start_date + (duration - 1), by = "day")
+        for (trial in 1:n_trials) {
+          # Sample from clean windows only
+          start_idx <- sample(valid_starts, 1)
+          end_idx <- start_idx + duration - 1
           
+          # Generate outbreak shape
           fake_cases <- generate_outbreak_shape(total_fake, duration, cumulative = TRUE)
           
-          slice <- s_data |> dplyr::filter(Date %in% window) |> dplyr::arrange(Date)
-          if (nrow(slice) < duration) next
+          # Inject outbreak
+          modified_obs <- syn_data$Observed
+          modified_obs[start_idx:end_idx] <- modified_obs[start_idx:end_idx] + fake_cases
           
-          injected_obs <- slice$Observed + fake_cases
-          new_bias <- mean(injected_obs) / mean(slice$Raw_Pred)
-          if (is.na(new_bias) || is.infinite(new_bias)) new_bias <- 1
+          # Check if any day in outbreak window would now trigger alarm
+          expected <- syn_data$Adaptive_Pred[start_idx:end_idx]
+          theta <- syn_data$Theta[start_idx:end_idx]
+          limit_99 <- qnbinom(0.99, mu = expected, size = theta)
           
-          new_thresh_99 <- stats::qnbinom(0.99, mu = slice$Raw_Pred * new_bias, size = slice$Theta)
-          
-          if (sum(injected_obs > new_thresh_99) > 0) detected <- detected + 1
+          # Detection = at least one day exceeds 99% threshold
+          if (any(modified_obs[start_idx:end_idx] > limit_99, na.rm = TRUE)) {
+            detected <- detected + 1
+          }
+          valid_trials <- valid_trials + 1
         }
         
         dplyr::tibble(
           Total_Cases = total_fake,
-          POD = detected / n_trials,
-          sindrome = s,
+          POD = if (valid_trials > 0) detected / valid_trials else NA_real_,
+          Valid_Trials = valid_trials,
+          Clean_Windows = length(valid_starts),
+          sindrome = sindrome,
           Duration_Days = duration
         )
       })
     }, .options = furrr::furrr_options(seed = TRUE))
     
-    final_results[[a]] <- area_pod
+    results_list[[a]] <- area_pod
+    cat("  Complete. Syndromes processed:", length(unique(area_pod$sindrome)), "\n")
   }
-  return(final_results)
+  
+  return(results_list)
 }
-
-
 #' Run Sensitivity Analysis for Farrington - SINGLE AREA, PARALLEL
 #'
 #' Processes one area at a time with parallel workers.
