@@ -207,44 +207,6 @@ generate_outbreak_shape <- function(total_cases, duration = 14, cumulative = TRU
   return(round(final_curve))
 }
 
-
-#' Create Multivariate STS Object
-#'
-#' Builds a surveillance::sts object with all syndromes as columns.
-#' This is the proper way to use the surveillance package - one matrix, not loops.
-#'
-#' @param area_data Dataframe filtered for a single area
-#' @return A surveillance::sts object with multivariate observed matrix
-#' @export
-create_sts_object <- function(area_data) {
-  library(surveillance)
-  
-  
-  # Pivot to wide format: rows = dates, columns = syndromes
-  wide_data <- area_data |>
-    dplyr::select(Data_inizio_sett, sindrome, casi) |>
-    tidyr::pivot_wider(names_from = sindrome, values_from = casi) |>
-    dplyr::arrange(Data_inizio_sett)
-  
-  dates <- wide_data$Data_inizio_sett
-  obs_matrix <- as.matrix(wide_data |> dplyr::select(-Data_inizio_sett))
-  
-  # Ensure integer counts
-  
-  obs_matrix <- apply(obs_matrix, 2, as.integer)
-  
-  # Create sts object
-  sts_obj <- surveillance::sts(
-    observed = obs_matrix,
-    epoch = as.numeric(dates),
-    epochAsDate = TRUE,
-    frequency = 365
-  )
-  
-  return(sts_obj)
-}
-
-
 #' Get Validation Range Indices
 #'
 #' Returns the row indices for the validation/test period.

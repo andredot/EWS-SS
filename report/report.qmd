@@ -173,18 +173,18 @@ fit_surveillance_model <- function(df_subset) {
   
   results <- df_subset |>
     mutate(
-      expected = exp(preds$fit),
+      expected = as.vector(exp(preds$fit)),
       # Approach A: Negative Binomial Quantiles
-      p_val = pnbinom(casi - 1, mu = expected, size = theta, lower.tail = FALSE),
-      limit_95_A = qnbinom(0.95, mu = expected, size = theta),
-      limit_99_A = qnbinom(0.99, mu = expected, size = theta),
+      p_val = as.vector(pnbinom(casi - 1, mu = expected, size = theta, lower.tail = FALSE)),
+      limit_95_A = as.vector(qnbinom(0.95, mu = expected, size = theta)),
+      limit_99_A = as.vector(qnbinom(0.99, mu = expected, size = theta)),
       status_A = case_when(
         casi > limit_99_A ~ "RED",
         casi > limit_95_A ~ "YELLOW",
         TRUE ~ "GREEN"
       ),
       # Approach B: Sigma Scores
-      std_residual = (casi - expected) / sqrt(expected + (expected^2 / theta)),
+      std_residual = as.vector((casi - expected) / sqrt(expected + (expected^2 / theta))),
       status_B = case_when(
         std_residual > 2.57 ~ "RED",    
         std_residual > 1.96 ~ "YELLOW", 

@@ -22,7 +22,7 @@ list(
   
   # Analysis  ---------------------------------------------------------------
   
-  tar_target(ops_results, run_operational_model(clean_data)),
+  # tar_target(ops_results, run_operational_model(clean_data)),
   tar_target(val_results, run_rolling_validation(clean_data)),
   
   tar_target(farrington_results, run_farrington_validation(clean_data)),

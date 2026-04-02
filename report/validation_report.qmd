@@ -212,7 +212,7 @@ We test magnitudes on a base-2 logarithmic scale:$$\text{Total Cases} = 2^x$$whe
 We simulated n=50 random outbreaks for each magnitude level to account for seasonality (e.g., an outbreak in August is easier to spot than in January).
 
 ```{r synthetic-setup}
-all_sens_results <- tar_read(sens_results)
+all_sens_results <- tar_read(sens_results_gam)
 pod_df <- all_sens_results[[params$area]]
 ```
 

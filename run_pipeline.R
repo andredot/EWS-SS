@@ -12,10 +12,6 @@ cat("="
 cat("Pipeline started at:", format(start_time, "%Y-%m-%d %H:%M:%S"), "\n")
 cat(rep("=", 61), "\n\n", sep = "")
 
-library(progressr)
-handlers(global = TRUE)
-handlers("txtprogressbar")
-
 # Set up logging
 log_file <- paste0("pipeline_log_", format(Sys.Date(), "%Y%m%d"), ".txt")
 sink(log_file, append = FALSE, split = TRUE)  # Log to file AND console
