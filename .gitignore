@@ -8,6 +8,8 @@ report_files
 .httr-oauth
 .DS_Store
 .quarto
-pat.R
 renv
-_targets
+_targets/
+_output
+
+pat.R
