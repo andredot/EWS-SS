@@ -51,9 +51,3 @@ tryCatch({
   # Print summary to console
   cat("\nLog saved to:", log_file, "\n")
 })
-
-# Optional: Play sound when done (works on macOS)
-# system("afplay /System/Library/Sounds/Glass.aiff")
-
-# Optional: Send notification (works on macOS)
-# system('osascript -e "display notification \\"Pipeline finished\\" with title \\"targets\\""')
