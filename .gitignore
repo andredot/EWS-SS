@@ -11,3 +11,4 @@ report_files
 pat.R
 renv
 _targets
+output/
